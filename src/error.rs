@@ -10,6 +10,12 @@ pub enum CacheError {
     Cache(String),
     #[error("Invalid input: {0}")]
     InvalidInput(String),
-    #[error("Hyper error: {0}")]
-    Hyper(#[from] hyper::Error),
+    #[error("Configuration error: {0}")]
+    Config(String),
+    #[error("Performance error: {0}")]
+    Performance(String),
+    #[error("Resource limit exceeded: {0}")]
+    ResourceLimit(String),
+    #[error("Timeout error: {0}")]
+    Timeout(String),
 } 
