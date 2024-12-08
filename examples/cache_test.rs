@@ -58,15 +58,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 获取缓存统计
-    match cache.get_stats().await {
-        Ok(stats) => {
-            info!("Cache stats:");
-            info!("  - Total entries: {}", stats.total_entries);
-            info!("  - Used space: {} bytes", stats.used_space);
-            info!("  - Usage: {:.1}%", stats.usage_percent);
-        }
-        Err(e) => warn!("Failed to get cache stats: {}", e),
-    }
+    let stats = cache.get_stats().await;
+    info!("Cache stats:");
+    info!("  - Total entries: {}", stats.total_entries);
+    info!("  - Used space: {} bytes", stats.used_space);
+    info!("  - Usage: {:.1}%", stats.usage_percent);
 
     // 清理测试
     match cache.cleanup().await {
@@ -76,4 +72,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Cache test completed");
     Ok(())
-} 
+}
