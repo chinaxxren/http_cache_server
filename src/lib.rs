@@ -1,3 +1,5 @@
+use serde::{Serialize, Deserialize};
+
 pub mod error {
     use thiserror::Error;
     use std::io;
@@ -36,10 +38,15 @@ mod plugin;
 mod plugin_manager;
 mod plugins;
 pub mod config;
+pub mod proxy;
+pub mod performance;
+pub mod storage;
+pub mod url_mapper;
 
 pub use plugin::Plugin;
 pub use plugin_manager::PluginManager;
 pub use config::Config;
+pub use proxy::ProxyServer;
 
 // Re-export plugins
 pub mod prelude {
@@ -49,4 +56,8 @@ pub mod prelude {
     pub use crate::plugins::security::SecurityPlugin;
     pub use crate::config::Config;
     pub use crate::error::PluginError;
+    pub use crate::proxy::ProxyServer;
+    pub use crate::performance::*;
+    pub use crate::storage::*;
+    pub use crate::url_mapper::*;
 } 

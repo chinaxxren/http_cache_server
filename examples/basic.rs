@@ -1,64 +1,63 @@
 use http_cache_server::prelude::*;
 use http_cache_server::PluginManager;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{info, warn, error, debug, instrument};
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化日志
     tracing_subscriber::fmt()
-        .with_env_filter("info")
+        .with_env_filter("debug")
+        .with_file(true)
+        .with_line_number(true)
         .init();
 
-    info!("Starting example...");
+    info!("Starting basic example");
 
     // 加载配置
-    let config = Config::load()?;
+    let config = match Config::load() {
+        Ok(cfg) => {
+            info!("Configuration loaded successfully");
+            cfg
+        }
+        Err(e) => {
+            error!("Failed to load configuration: {}", e);
+            return Err(e.into());
+        }
+    };
 
-    // 创建插件
+    // 创建插件管理器
+    let plugin_manager = Arc::new(PluginManager::new());
+    debug!("Plugin manager initialized");
+
+    // 创建并注册插件
     let hls_plugin = Arc::new(HLSPlugin::new(
         config.plugins.hls.cache_dir.to_string_lossy().to_string(),
     ));
-
-    let storage_plugin = Arc::new(StoragePlugin::new(
-        config.plugins.storage.root_path,
-        config.plugins.storage.max_size,
-    ));
-
-    let security_plugin = Arc::new(SecurityPlugin::new(
-        config.plugins.security.rate_limit,
-    ));
-
-    // 初始化插件管理器
-    let plugin_manager = Arc::new(PluginManager::new());
     plugin_manager.register_plugin(hls_plugin.clone()).await?;
-    plugin_manager.register_plugin(storage_plugin.clone()).await?;
-    plugin_manager.register_plugin(security_plugin.clone()).await?;
+    info!("HLS plugin registered");
 
     // 使用 HLS 插件
-    hls_plugin.add_stream("stream1".to_string(), 5000.0).await?;
+    let stream_id = "test_stream";
+    debug!("Adding test stream: {}", stream_id);
+    hls_plugin.add_stream(stream_id.to_string(), 5000.0).await?;
     
     let url = "http://example.com/segment1.ts";
-    match hls_plugin.download_segment(url, "stream1").await {
-        Ok(data) => info!("Downloaded {} bytes from {}", data.len(), url),
+    info!("Attempting to download segment: {}", url);
+    match hls_plugin.download_segment(url, stream_id).await {
+        Ok(data) => info!("Successfully downloaded {} bytes", data.len()),
         Err(e) => warn!("Failed to download segment: {}", e),
     }
-
-    // 使用存储插件
-    let storage_status = storage_plugin.health_check().await?;
-    info!("Storage health status: {}", storage_status);
-
-    // 使用安全插件
-    security_plugin.add_allowed_origin("https://example.com".to_string()).await;
 
     // 健康检查
     let health_status = plugin_manager.health_check().await;
     info!("Plugin health status: {:?}", health_status);
 
     // 清理资源
+    info!("Cleaning up resources");
     plugin_manager.cleanup().await?;
-    info!("Example completed");
+    info!("Example completed successfully");
 
     Ok(())
 } 

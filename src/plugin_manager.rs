@@ -23,6 +23,7 @@ impl PluginManager {
         
         let mut plugins = self.plugins.write().await;
         if plugins.contains_key(&plugin_name) {
+            error!("Plugin {} already registered", plugin_name);
             return Err(PluginError::Plugin(format!("Plugin {} already registered", plugin_name)));
         }
 
@@ -44,12 +45,15 @@ impl PluginManager {
     }
 
     pub async fn cleanup(&self) -> Result<(), PluginError> {
+        info!("Starting plugin cleanup");
         let plugins = self.plugins.read().await;
         for (name, plugin) in plugins.iter() {
+            info!("Cleaning up plugin: {}", name);
             if let Err(e) = plugin.cleanup().await {
                 error!("Error cleaning up plugin {}: {}", name, e);
             }
         }
+        info!("Plugin cleanup completed");
         Ok(())
     }
 

@@ -9,6 +9,7 @@
 - 存储管理
 - 安全控制
 - 配置灵活
+- 详细的日志记录
 
 ## 运行
 
@@ -20,6 +21,43 @@ cargo run
 2. 使用自定义配置运行：
 ```bash
 CONFIG_PATH=./config.toml cargo run
+```
+
+3. 设置日志级别：
+```bash
+RUST_LOG=debug cargo run
+```
+
+## 日志系统
+
+服务器使用 tracing 进行日志记录，支持以下特性：
+
+- 多个日志级别 (ERROR, WARN, INFO, DEBUG)
+- 结构化日志
+- 请求追踪
+- 性能指标记录
+- 文件名和行号
+- 线程ID
+
+### 日志示例
+
+```
+2024-03-21T10:15:30.123Z INFO  [server] Starting HTTP Cache Server
+2024-03-21T10:15:30.124Z DEBUG [config] Loading configuration from config.toml
+2024-03-21T10:15:30.125Z INFO  [plugin] Registering HLS plugin v1.0.0
+2024-03-21T10:15:30.126Z DEBUG [hls] Adding stream test_stream with bandwidth 5000.0
+2024-03-21T10:15:30.127Z WARN  [security] Origin blocked: https://malicious.com
+```
+
+### 日志配置
+
+可以通过环境变量或配置文件设置日志级别和格式：
+
+```toml
+[log]
+level = "debug"
+show_file_line = true
+show_thread_id = true
 ```
 
 ## 配置说明
@@ -135,22 +173,4 @@ match plugin.download_segment(url, stream_id).await {
     Err(PluginError::Storage(e)) => eprintln!("Storage error: {}", e),
     Err(e) => eprintln!("Other error: {}", e),
 }
-```
-
-## 日志记录
-
-服务器使用 tracing 进行日志记录：
-
-```rust
-use tracing::{info, warn, error};
-
-// 初始化日志
-tracing_subscriber::fmt()
-    .with_env_filter("info")
-    .init();
-
-// 记录日志
-info!("Starting server...");
-warn!("Resource usage high");
-error!("Failed to process request: {}", error);
 ```
