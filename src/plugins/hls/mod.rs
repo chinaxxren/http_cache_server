@@ -20,7 +20,6 @@ use segment::SegmentManager;
 pub struct HLSPlugin {
     config: HLSConfig,
     state: Arc<RwLock<HLSState>>,
-    segment_manager: Arc<SegmentManager>,
     cache: Arc<CacheManager>,
     prefetch_tx: mpsc::Sender<String>,
 }
@@ -65,7 +64,6 @@ impl HLSPlugin {
                 let plugin = HLSPlugin {
                     config: HLSConfig::default(),
                     state: Arc::new(RwLock::new(HLSState::default())),
-                    segment_manager: segment_manager.clone(),
                     cache: cache_clone.clone(),
                     prefetch_tx: tx_clone.clone(),
                 };
@@ -79,7 +77,6 @@ impl HLSPlugin {
         Self {
             config: HLSConfig::default(),
             state: Arc::new(RwLock::new(HLSState::default())),
-            segment_manager,
             cache,
             prefetch_tx: tx,
         }
@@ -154,7 +151,6 @@ impl Clone for HLSPlugin {
         Self {
             config: self.config.clone(),
             state: self.state.clone(),
-            segment_manager: self.segment_manager.clone(),
             cache: self.cache.clone(),
             prefetch_tx: self.prefetch_tx.clone(),
         }
