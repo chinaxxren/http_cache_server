@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::net::SocketAddr;
-use http_cache_server::prelude::*;
-use http_cache_server::{Config, PluginManager};
+use http_cache_server::{plugin_manager::PluginManager, prelude::*};
 use tracing::{info, warn, error, debug, instrument};
 
 #[tokio::main]

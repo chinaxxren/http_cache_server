@@ -12,16 +12,16 @@ name = "hls_streaming"
 path = "examples/hls_streaming.rs"
 
 [[example]]
-name = "bandwidth_control"
-path = "examples/bandwidth_control.rs"
-
-[[example]]
-name = "security"
-path = "examples/security.rs"
+name = "cache_test"
+path = "examples/cache_test.rs"
 
 [[example]]
 name = "storage_test"
 path = "examples/storage_test.rs"
+
+[[example]]
+name = "security"
+path = "examples/security.rs"
 
 [dependencies]
 tokio = { version = "1.28", features = ["full", "signal", "macros"] }

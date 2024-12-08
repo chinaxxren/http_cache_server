@@ -1,52 +1,13 @@
 use serde::{Serialize, Deserialize};
 
-pub mod error {
-    use thiserror::Error;
-    use std::io;
-
-    #[derive(Error, Debug)]
-    pub enum PluginError {
-        #[error("IO error: {0}")]
-        Io(#[from] io::Error),
-        
-        #[error("Plugin error: {0}")]
-        Plugin(String),
-        
-        #[error("Initialization error: {0}")]
-        Init(String),
-        
-        #[error("Network error: {0}")]
-        Network(String),
-        
-        #[error("Config error: {0}")]
-        Config(String),
-        
-        #[error("HLS error: {0}")]
-        Hls(String),
-        
-        #[error("Storage error: {0}")]
-        Storage(String),
-        
-        #[error("Security error: {0}")]
-        Security(String),
-    }
-}
-
-pub type Result<T> = std::result::Result<T, error::PluginError>;
-
-mod plugin;
-mod plugin_manager;
-mod plugins;
+pub mod error;
 pub mod config;
+pub mod plugin;
+pub mod plugin_manager;
 pub mod proxy;
-pub mod performance;
-pub mod storage;
-pub mod url_mapper;
 
-pub use plugin::Plugin;
-pub use plugin_manager::PluginManager;
-pub use config::Config;
-pub use proxy::ProxyServer;
+// 插件模块
+pub mod plugins;
 
 // Re-export plugins
 pub mod prelude {
@@ -54,10 +15,9 @@ pub mod prelude {
     pub use crate::plugins::hls::HLSPlugin;
     pub use crate::plugins::storage::StoragePlugin;
     pub use crate::plugins::security::SecurityPlugin;
+    pub use crate::plugins::cache::CacheManager;
+    pub use crate::plugins::bandwidth::BandwidthManager;
     pub use crate::config::Config;
     pub use crate::error::PluginError;
     pub use crate::proxy::ProxyServer;
-    pub use crate::performance::*;
-    pub use crate::storage::*;
-    pub use crate::url_mapper::*;
 } 

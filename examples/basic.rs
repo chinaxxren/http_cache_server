@@ -1,5 +1,5 @@
 use http_cache_server::prelude::*;
-use http_cache_server::PluginManager;
+use http_cache_server::plugin_manager::PluginManager;
 use std::sync::Arc;
 use tracing::{info, warn, error, debug, instrument};
 use std::time::Duration;

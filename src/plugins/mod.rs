@@ -2,8 +2,8 @@ pub mod hls;
 pub mod storage;
 pub mod security;
 pub mod cache;
-mod network;
-mod bandwidth;
+pub mod bandwidth;
+pub mod network;
 
 use tracing::debug;
 
