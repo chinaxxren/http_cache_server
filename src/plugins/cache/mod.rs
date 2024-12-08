@@ -4,6 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn, error, debug};
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
+use std::io::SeekFrom;
+use tokio::io::AsyncSeekExt;
 
 use crate::error::PluginError;
 
@@ -191,6 +195,44 @@ impl CacheManager {
                 }
             }
         });
+    }
+
+    pub async fn store_stream<'a>(&self, key: String, metadata: CacheMetadata) -> Result<File, PluginError> {
+        let file_path = self.root_path.join(&key);
+        let file = File::create(&file_path).await
+            .map_err(|e| PluginError::Storage(e.to_string()))?;
+
+        let mut state = self.state.write().await;
+        state.entries.insert(key.clone(), CacheEntry {
+            path: file_path,
+            size: 0,  // 初始大小为0
+            last_access: Instant::now(),
+            metadata,
+        });
+
+        Ok(file)
+    }
+
+    pub async fn append_chunk(&self, key: &str, chunk: &[u8]) -> Result<(), PluginError> {
+        let mut state = self.state.write().await;
+        
+        if let Some(entry) = state.entries.get_mut(key) {
+            let mut file = File::options()
+                .append(true)
+                .open(&entry.path)
+                .await
+                .map_err(|e| PluginError::Storage(e.to_string()))?;
+
+            file.write_all(chunk).await
+                .map_err(|e| PluginError::Storage(e.to_string()))?;
+
+            entry.size += chunk.len() as u64;
+            state.used_space += chunk.len() as u64;
+
+            Ok(())
+        } else {
+            Err(PluginError::Storage("Cache entry not found".into()))
+        }
     }
 }
 
