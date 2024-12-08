@@ -1,119 +1,76 @@
 # HTTP Cache Server
 
-一个高性能的 HTTP 缓存服务器，专门针对 HLS 流媒体进行了优化。支持智能缓存管理、带宽控制和性能优化。
+一个基于插件架构的 HTTP 缓存服务器。
 
-## 主要特性
+## 功能特性
 
-### 1. HLS 流媒体支持
-- 播放列表解析和处理
-- 分片缓存和预加载
-- 多码率自适应支持
-- 直播流处理
-- 智能分片合并
+- 插件化架构
+- HLS 流媒体支持
+- 存储管理
+- 安全控制
+- 配置灵活
 
-### 2. 缓存管理
-- 基于时间的过期清理
-- 基于容量的 LRU 清理
-- 基于访问频率的清理
-- 智能缓存预热
-- 分片存储优化
+## 运行
 
-### 3. 性能优化
-- 预测性缓存
-  - 顺序访问优化
-  - 周期性访问识别
-  - 随机访问处理
-- 热点内容优化
-  - 动态热度计算
-  - 自适应缓存策略
-- 分片合并策略
-  - 智能分组
-  - 大小限制
-  - 访问模式适应
+1. 使用默认配置运行：
+```bash
+cargo run
+```
 
-### 4. 带宽控制
-- 动态带宽限制
-- 令牌桶算法
-- 自适应码率选择
-- 带宽监控和测量
+2. 使用自定义配置运行：
+```bash
+CONFIG_PATH=./config.toml cargo run
+```
 
-### 5. 资源管理
-- 并发下载控制
-- 内存使用优化
-- 磁盘空间管理
-- 资源清理策略
+## 配置说明
 
-## 技术栈
-- Rust
-- Tokio 异步运行时
-- Hyper HTTP 服务器
-- M3U8 解析器
-- 异步 I/O
+### HLS 插件配置
+```toml
+[plugins.hls]
+cache_dir = "./cache/hls"      # HLS 缓存目录
+segment_duration = 10          # 分片时长(秒)
+max_segments = 30             # 最大分片数
+```
 
-## 系统要求
-- Rust 1.70 或更高版本
-- 支持异步 I/O 的操作系统
-- 足够的磁盘空间用于缓存
+### 存储插件配置
+```toml
+[plugins.storage]
+root_path = "./storage"       # 存储根目录
+max_size = 1073741824        # 最大存储空间(1GB)
+```
 
-## 配置项
-- 最大并发下载数
-- 缓存容量限制
-- 带宽限制
-- 分片合并阈值
-- 清理周期
-- 预加载深度
+### 安全插件配置
+```toml
+[plugins.security]
+rate_limit = 100             # 请求速率限制
+allowed_origins = []         # 允许的来源
+```
 
 ## 使用示例
 
 ### 基本使用
 
 ```rust
-use http_cache_server::{
-    HlsHandler,
-    Loader,
-    UrlMapper,
-    BandwidthController,
-    CacheStrategy,
-    PerformanceOptimizer,
-};
+use http_cache_server::prelude::*;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // 初始化组件
-    let loader = Arc::new(Loader::new());
-    let url_mapper = Arc::new(UrlMapper::new());
-    let bandwidth_controller = Arc::new(BandwidthController::new(1_000_000)); // 1Mbps
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 初始化插件
+    let hls_plugin = Arc::new(HLSPlugin::new("./cache".to_string()));
     
-    // 创建 HLS 处理器
-    let handler = HlsHandler::new(
-        loader.clone(),
-        url_mapper.clone(),
-        bandwidth_controller.clone(),
-    );
-
-    // 配置缓存策略
-    let storage = Arc::new(Storage::new("cache")?);
-    let cache_strategy = Arc::new(CacheStrategy::new(
-        storage.clone(),
-        Duration::from_secs(3600), // 1小时过期
-        1024 * 1024 * 1024,       // 1GB 容量限制
-        5,                        // 最小访问次数
-    ));
-
-    // 配置性能优化
-    let optimizer = Arc::new(PerformanceOptimizer::new(
-        storage,
-        1024 * 1024 * 5,         // 5MB 分片合并阈值
-    ));
-
-    // 启动缓存清理任务
-    cache_strategy.clone().start_cleaning_task().await;
-
-    // 处理 HLS 流
-    handler.handle_adaptive_playback("http://example.com/stream.m3u8").await?;
-
+    // 添加流
+    hls_plugin.add_stream("stream1".to_string(), 5000.0).await?;
+    
+    // 下载分片
+    let data = hls_plugin.download_segment(
+        "http://example.com/segment1.ts",
+        "stream1"
+    ).await?;
+    
+    // 更新带宽
+    hls_plugin.update_bandwidth("stream1", 6000.0).await?;
+    
     Ok(())
 }
 ```
@@ -121,59 +78,79 @@ async fn main() -> Result<()> {
 ### 高级功能
 
 ```rust
-// 智能预加载
-handler.smart_preload("http://example.com/stream.m3u8", 5).await?;
+// 配置网络重试
+let plugin = Arc::new(HLSPlugin::new("./cache".to_string()));
+plugin.set_max_retries(5).await;
+plugin.set_timeout(Duration::from_secs(60)).await;
 
-// 缓存预热
-handler.warmup_cache("http://example.com/master.m3u8", 3).await?;
+// 使用存储插件
+let storage = Arc::new(StoragePlugin::new("./storage".into(), 1024 * 1024 * 1024));
+storage.cleanup_expired().await?;
 
-// 直播流处理
-handler.handle_live_stream_optimized(
-    "http://example.com/live.m3u8",
-    10,  // 最大分片数
-    3,   // 合并阈值
-).await?;
+// 使用安全插件
+let security = Arc::new(SecurityPlugin::new(100));
+security.add_allowed_origin("https://example.com".to_string()).await;
 ```
 
-## 性能特性
+## 插件开发
 
-- 智能预加载减少延迟
-  - 基于访问模式的预测
-  - 自适应预加载深度
-  - 热点内容优先
+实现 Plugin trait 来创建新插件：
 
-- 高效的缓存管理
-  - 多级清理策略
-  - 动态容量调整
-  - 访问频率感知
+```rust
+#[async_trait]
+impl Plugin for MyPlugin {
+    fn name(&self) -> &str {
+        "my_plugin"
+    }
 
-- 带宽优化
-  - 自适应码率选择
-  - 动态带宽控制
-  - 令牌桶限流
+    fn version(&self) -> &str {
+        "1.0.0"
+    }
 
-- 资源利用
-  - 智能分片合并
-  - 并发请求控制
-  - 内存使用优化
+    async fn init(&self) -> Result<(), PluginError> {
+        // 初始化逻辑
+        Ok(())
+    }
 
-## 最佳实践
+    async fn cleanup(&self) -> Result<(), PluginError> {
+        // 清理逻辑
+        Ok(())
+    }
 
-1. 合理配置
-   - 根据系统资源设置合适的并发数
-   - 设置适当的缓存容量限制
-   - 调整带宽控制参数
+    async fn health_check(&self) -> Result<bool, PluginError> {
+        // 健康检查逻辑
+        Ok(true)
+    }
+}
+```
 
-2. 性能优化
-   - 启用智能预加载
-   - 配置合适的分片合并阈值
-   - 利用缓存预热
+## 错误处理
 
-3. 运维建议
-   - 定期监控磁盘使用
-   - 观察带宽使用情况
-   - 及时清理过期缓存
+```rust
+use http_cache_server::error::PluginError;
 
-## 许可证
+match plugin.download_segment(url, stream_id).await {
+    Ok(data) => println!("Downloaded {} bytes", data.len()),
+    Err(PluginError::Network(e)) => eprintln!("Network error: {}", e),
+    Err(PluginError::Storage(e)) => eprintln!("Storage error: {}", e),
+    Err(e) => eprintln!("Other error: {}", e),
+}
+```
 
-MIT License
+## 日志记录
+
+服务器使用 tracing 进行日志记录：
+
+```rust
+use tracing::{info, warn, error};
+
+// 初始化日志
+tracing_subscriber::fmt()
+    .with_env_filter("info")
+    .init();
+
+// 记录日志
+info!("Starting server...");
+warn!("Resource usage high");
+error!("Failed to process request: {}", error);
+```

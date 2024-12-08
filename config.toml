@@ -1,0 +1,16 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[plugins.hls]
+cache_dir = "./cache/hls"
+segment_duration = 10
+max_segments = 30
+
+[plugins.storage]
+root_path = "./storage"
+max_size = 1073741824  # 1GB
+
+[plugins.security]
+rate_limit = 100
+allowed_origins = [] 
