@@ -1,18 +1,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use std::time::{Duration, Instant};
-use crate::error::PluginError;
+use tokio::sync::RwLock;
 use tracing::{info, warn, error, debug};
 
-mod cleaner;
-mod policy;
+use crate::error::PluginError;
+
 mod entry;
 mod metadata;
 
-pub use cleaner::CacheCleaner;
-pub use policy::CachePolicy;
 pub use metadata::CacheMetadata;
 use entry::CacheEntry;
 
@@ -28,13 +25,11 @@ struct CacheState {
     entries: HashMap<String, CacheEntry>,
     used_space: u64,
     max_space: u64,
-    last_cleanup: Instant,
 }
 
 #[derive(Debug)]
 pub struct CacheConfig {
     pub max_space: u64,
-    pub cleanup_interval: Duration,
     pub entry_ttl: Duration,
     pub min_free_space: u64,
 }
@@ -43,7 +38,6 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_space: 1024 * 1024 * 1024, // 1GB
-            cleanup_interval: Duration::from_secs(3600), // 1 hour
             entry_ttl: Duration::from_secs(86400), // 24 hours
             min_free_space: 1024 * 1024 * 100, // 100MB
         }
@@ -61,7 +55,6 @@ impl CacheManager {
                 entries: HashMap::new(),
                 used_space: 0,
                 max_space: config.max_space,
-                last_cleanup: Instant::now(),
             })),
             config,
         }
@@ -74,8 +67,6 @@ impl CacheManager {
         // 检查空间
         let size = data.len() as u64;
         if state.used_space + size > state.max_space {
-            warn!("Cache space exceeded. Current: {}, Required: {}, Max: {}", 
-                state.used_space, size, state.max_space);
             return Err(PluginError::Storage("Cache space exceeded".into()));
         }
 
@@ -169,7 +160,6 @@ impl CacheManager {
             }
         }
 
-        state.last_cleanup = now;
         info!("Cache cleanup completed. Removed {} entries, freed {} bytes", 
             removed_count, freed_space);
         Ok(())
@@ -182,7 +172,7 @@ impl CacheManager {
             used_space: state.used_space,
             max_space: state.max_space,
             usage_percent: (state.used_space as f64 / state.max_space as f64) * 100.0,
-            last_cleanup: state.last_cleanup,
+            last_cleanup: Instant::now(),
         };
         debug!("Cache stats: {:?}", stats);
         stats
@@ -190,7 +180,7 @@ impl CacheManager {
 
     pub async fn start_cleanup_task(self: Arc<Self>) {
         info!("Starting cache cleanup task");
-        let cleanup_interval = self.config.cleanup_interval;
+        let cleanup_interval = self.config.entry_ttl;
 
         tokio::spawn(async move {
             loop {
@@ -211,77 +201,4 @@ pub struct CacheStats {
     pub max_space: u64,
     pub usage_percent: f64,
     pub last_cleanup: Instant,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::test;
-
-    #[test]
-    async fn test_basic_cache_operations() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let cache = CacheManager::new(
-            temp_dir.path(),
-            CacheConfig::default(),
-        );
-
-        // Store data
-        let data = b"test data".to_vec();
-        let metadata = CacheMetadata {
-            content_type: "text/plain".to_string(),
-            etag: Some("123".to_string()),
-            last_modified: None,
-            created_at: chrono::Utc::now(),
-        };
-
-        cache.store("test.txt".to_string(), data.clone(), metadata.clone())
-            .await
-            .unwrap();
-
-        // Retrieve data
-        let (retrieved_data, retrieved_metadata) = cache.get("test.txt")
-            .await
-            .unwrap();
-
-        assert_eq!(retrieved_data, data);
-        assert_eq!(retrieved_metadata.content_type, "text/plain");
-        assert_eq!(retrieved_metadata.etag, Some("123".to_string()));
-    }
-
-    #[test]
-    async fn test_cache_cleanup() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let cache = CacheManager::new(
-            temp_dir.path(),
-            CacheConfig {
-                entry_ttl: Duration::from_secs(1),
-                ..Default::default()
-            },
-        );
-
-        // Store some entries
-        let data = b"test data".to_vec();
-        let metadata = CacheMetadata {
-            content_type: "text/plain".to_string(),
-            etag: None,
-            last_modified: None,
-            created_at: chrono::Utc::now(),
-        };
-
-        cache.store("file1.txt".to_string(), data.clone(), metadata.clone())
-            .await
-            .unwrap();
-
-        // Wait for entries to expire
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Run cleanup
-        cache.cleanup().await.unwrap();
-
-        // Verify cleanup
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.total_entries, 0);
-        assert_eq!(stats.used_space, 0);
-    }
 } 

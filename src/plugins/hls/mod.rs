@@ -1,31 +1,31 @@
-use crate::plugin::Plugin;
-use crate::error::PluginError;
-use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use super::network::NetworkManager;
-use super::bandwidth::BandwidthManager;
+
+use tokio::sync::{RwLock, mpsc};
 use tracing::{info, warn, error, debug, instrument};
+use bytes::Bytes;
+use uuid::Uuid;
+use async_trait::async_trait;
+use m3u8_rs::{MasterPlaylist, MediaPlaylist, parse_master_playlist, parse_media_playlist};
 
-mod adaptive;
+use crate::error::PluginError;
+use crate::plugin::Plugin;
+use crate::plugins::cache::{CacheManager, CacheMetadata};
+
 mod segment;
-
-use adaptive::AdaptiveStreamManager;
 use segment::SegmentManager;
 
 #[derive(Debug)]
 pub struct HLSPlugin {
     config: HLSConfig,
     state: Arc<RwLock<HLSState>>,
-    adaptive_manager: Arc<AdaptiveStreamManager>,
     segment_manager: Arc<SegmentManager>,
-    network_manager: Arc<NetworkManager>,
-    bandwidth_manager: Arc<BandwidthManager>,
+    cache: Arc<CacheManager>,
+    prefetch_tx: mpsc::Sender<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct HLSConfig {
     cache_dir: String,
     segment_duration: u32,
@@ -36,7 +36,14 @@ struct HLSConfig {
 #[derive(Debug)]
 struct HLSState {
     active_streams: HashMap<String, StreamInfo>,
-    _last_cleanup: Instant,
+}
+
+impl Default for HLSState {
+    fn default() -> Self {
+        Self {
+            active_streams: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -47,42 +54,124 @@ pub struct StreamInfo {
 }
 
 impl HLSPlugin {
-    pub fn new(cache_dir: String) -> Self {
+    pub fn new(cache_dir: String, cache: Arc<CacheManager>) -> Self {
         info!("Initializing HLSPlugin with cache directory: {}", cache_dir);
-        let config = HLSConfig {
-            cache_dir: cache_dir.clone(),
-            segment_duration: 10,
-            max_segments: 30,
-            bandwidth_check_interval: Duration::from_secs(5),
-        };
-        debug!("HLS configuration: {:?}", config);
+        
+        // 创建预取通道
+        let (tx, mut rx) = mpsc::channel(100);
+        let tx_clone = tx.clone();  // 克隆一个发送器用于异步任务
+        
+        // 启动预取处理任务
+        let cache_clone = cache.clone();
+        let segment_manager_clone = Arc::new(SegmentManager::new());
+        
+        tokio::spawn(async move {
+            while let Some(uri) = rx.recv().await {
+                let plugin = HLSPlugin {
+                    config: HLSConfig::default(),
+                    state: Arc::new(RwLock::new(HLSState::default())),
+                    segment_manager: segment_manager_clone.clone(),
+                    cache: cache_clone.clone(),
+                    prefetch_tx: tx_clone.clone(),  // 使用克隆的发送器
+                };
 
-        let state = Arc::new(RwLock::new(HLSState {
-            active_streams: HashMap::new(),
-            _last_cleanup: Instant::now(),
-        }));
+                match plugin.handle_hls_request(&uri).await {
+                    Ok(_) => debug!("Successfully prefetched: {}", uri),
+                    Err(e) => warn!("Failed to prefetch {}: {}", uri, e),
+                }
+            }
+        });
 
-        let adaptive_manager = Arc::new(AdaptiveStreamManager::new());
-        let segment_manager = Arc::new(SegmentManager::new(cache_dir));
-        let network_manager = Arc::new(NetworkManager::new());
-        let bandwidth_manager = Arc::new(BandwidthManager::new());
-
-        info!("HLS plugin initialized successfully");
         Self {
-            config,
-            state,
-            adaptive_manager,
-            segment_manager,
-            network_manager,
-            bandwidth_manager,
+            config: HLSConfig::default(),
+            state: Arc::new(RwLock::new(HLSState::default())),
+            segment_manager: Arc::new(SegmentManager::new()),
+            cache,
+            prefetch_tx: tx,  // 使用原始发送器
+        }
+    }
+
+    /// 处理 HLS 请求
+    pub async fn handle_hls_request(&self, uri: &str) -> Result<Vec<u8>, PluginError> {
+        let cache_key = format!("hls:{}", uri);
+
+        // 先尝试从缓存获取
+        if let Ok((data, _)) = self.cache.get(&cache_key).await {
+            return Ok(data);
+        }
+
+        // 缓存未命中，需要下载
+        let bytes = self.download_segment(uri, "default").await?;
+        let data = bytes.to_vec();
+
+        // 如果是 m3u8 文件，解析并预下载
+        if uri.ends_with(".m3u8") {
+            self.handle_playlist(&data, uri).await?;
+        }
+
+        // 缓存响应
+        let content_type = if uri.ends_with(".m3u8") {
+            "application/vnd.apple.mpegurl"
+        } else {
+            "video/mp2t"
+        };
+
+        let metadata = CacheMetadata::new(content_type.into())
+            .with_etag(format!("hls-{}", Uuid::new_v4()));
+
+        // 克隆数据用于缓存，留原始数据用于返回
+        let cache_data = data.clone();
+        if let Err(e) = self.cache.store(cache_key, cache_data, metadata).await {
+            warn!("Failed to cache response: {}", e);
+        }
+
+        Ok(data)
+    }
+
+    /// 处理播放列表
+    async fn handle_playlist(&self, data: &[u8], uri: &str) -> Result<(), PluginError> {
+        let playlist_str = String::from_utf8_lossy(data);
+        
+        // 尝试解析为主播放列表
+        if let Ok((_, master_playlist)) = parse_master_playlist(playlist_str.as_bytes()) {
+            self.handle_master_playlist(&master_playlist).await?;
+        } else if let Ok((_, media_playlist)) = parse_media_playlist(playlist_str.as_bytes()) {
+            self.handle_media_playlist(&media_playlist).await?;
+        } else {
+            warn!("Failed to parse playlist: {}", uri);
+        }
+
+        Ok(())
+    }
+
+    /// 处理主播放列表
+    async fn handle_master_playlist(&self, playlist: &MasterPlaylist) -> Result<(), PluginError> {
+        for variant in &playlist.variants {
+            let uri = variant.uri.clone();
+            self.prefetch_resource(&uri).await;
+        }
+        Ok(())
+    }
+
+    /// 处理媒体播放列表
+    async fn handle_media_playlist(&self, playlist: &MediaPlaylist) -> Result<(), PluginError> {
+        for segment in &playlist.segments {
+            let uri = segment.uri.clone();
+            self.prefetch_resource(&uri).await;
+        }
+        Ok(())
+    }
+
+    /// 预取资源
+    async fn prefetch_resource(&self, uri: &str) {
+        if let Err(e) = self.prefetch_tx.send(uri.to_string()).await {
+            warn!("Failed to queue prefetch for {}: {}", uri, e);
         }
     }
 
     pub async fn get_active_stream_count(&self) -> usize {
         let state = self.state.read().await;
-        let count = state.active_streams.len();
-        debug!("Current active stream count: {}", count);
-        count
+        state.active_streams.len()
     }
 
     pub async fn get_stream_info(&self, stream_id: &str) -> Option<StreamInfo> {
@@ -100,22 +189,21 @@ impl HLSPlugin {
     }
 
     pub async fn cleanup_old_streams(&self) -> Result<(), PluginError> {
-        info!("Starting stream cleanup");
         let mut state = self.state.write().await;
         let now = Instant::now();
-        let timeout = Duration::from_secs(3600);
+        let ttl = Duration::from_secs(3600); // 1小时
 
-        let before_count = state.active_streams.len();
-        state.active_streams.retain(|id, stream| {
-            let keep = now.duration_since(stream.last_access) < timeout;
-            if !keep {
-                info!("Removing inactive stream: {}", id);
-            }
-            keep
-        });
-        let after_count = state.active_streams.len();
-        
-        info!("Stream cleanup completed. Removed {} streams", before_count - after_count);
+        let expired: Vec<_> = state.active_streams
+            .iter()
+            .filter(|(_, s)| now.duration_since(s.last_access) > ttl)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for stream_id in expired {
+            state.active_streams.remove(&stream_id);
+            info!("Removed expired stream: {}", stream_id);
+        }
+
         Ok(())
     }
 
@@ -134,7 +222,6 @@ impl HLSPlugin {
                 0.0
             },
         };
-        debug!("Stream metrics: {:?}", metrics);
         Ok(metrics)
     }
 
@@ -147,29 +234,23 @@ impl HLSPlugin {
             bandwidth,
         });
         
-        self.adaptive_manager.register_stream(stream_id.clone(), bandwidth).await;
         info!("Stream {} added successfully", stream_id);
         Ok(())
     }
 
     pub async fn update_bandwidth(&self, stream_id: &str, bandwidth: f64) -> Result<(), PluginError> {
-        debug!("Updating bandwidth for stream {} to {} bps", stream_id, bandwidth);
         let mut state = self.state.write().await;
         if let Some(stream) = state.active_streams.get_mut(stream_id) {
             stream.bandwidth = bandwidth;
             stream.last_access = Instant::now();
-            info!("Bandwidth updated successfully for stream {}", stream_id);
+            Ok(())
         } else {
-            warn!("Stream {} not found for bandwidth update", stream_id);
-            return Err(PluginError::Hls(format!("Stream {} not found", stream_id)));
+            Err(PluginError::Hls("Stream not found".into()))
         }
-        
-        self.adaptive_manager.update_bandwidth(stream_id, bandwidth).await;
-        Ok(())
     }
 
     #[instrument(skip(self))]
-    async fn handle_segment_download(&self, url: &str, stream_id: &str) -> Result<bytes::Bytes, PluginError> {
+    async fn handle_segment_download(&self, url: &str, stream_id: &str) -> Result<Bytes, PluginError> {
         debug!("Starting segment download process for {}", url);
         let mut state = self.state.write().await;
         
@@ -200,17 +281,30 @@ impl HLSPlugin {
         }
 
         // 下载分片
-        let data = self.network_manager.get(url).await?;
+        let client = hyper::Client::new();
+        let uri = url.parse().map_err(|e| PluginError::Network(format!("Invalid URL: {}", e)))?;
         
-        // 更新分片列表
-        stream.segments.push(url.to_string());
-        info!(
-            "Added new segment to stream {}. Total segments: {}",
-            stream_id,
-            stream.segments.len()
-        );
+        match client.get(uri).await {
+            Ok(response) => {
+                let bytes = hyper::body::to_bytes(response.into_body())
+                    .await
+                    .map_err(|e| PluginError::Network(e.to_string()))?;
+                
+                // 更新分片列表
+                stream.segments.push(url.to_string());
+                info!(
+                    "Added new segment to stream {}. Total segments: {}",
+                    stream_id,
+                    stream.segments.len()
+                );
 
-        Ok(data)
+                Ok(bytes)
+            }
+            Err(e) => {
+                error!("Failed to download segment: {}", e);
+                Err(PluginError::Network(e.to_string()))
+            }
+        }
     }
 
     #[instrument(skip(self))]
@@ -230,49 +324,21 @@ impl HLSPlugin {
         }
     }
 
-    pub async fn download_segment(&self, url: &str, stream_id: &str) -> Result<bytes::Bytes, PluginError> {
+    pub async fn download_segment(&self, url: &str, stream_id: &str) -> Result<Bytes, PluginError> {
         debug!("Starting segment download for stream {} from {}", stream_id, url);
         
-        // 检查带宽限制
-        if let Err(e) = self.bandwidth_manager.check_limit(stream_id, 0).await {
-            warn!("Bandwidth limit check failed for stream {}: {}", stream_id, e);
-            return Err(e);
-        }
-        
         // 下载分片
-        match self.handle_segment_download(url, stream_id).await {
-            Ok(data) => {
-                let size = data.len();
-                info!(
-                    "Successfully downloaded segment for stream {}. Size: {} bytes",
-                    stream_id, size
-                );
-                
-                // 更新带宽使用
-                if let Err(e) = self.bandwidth_manager.check_limit(stream_id, size as u64).await {
-                    warn!(
-                        "Bandwidth limit exceeded after download for stream {}: {}",
-                        stream_id, e
-                    );
-                }
-                
-                // 更新分片管理器
-                self.segment_manager.add_segment(url.to_string(), size as u64).await;
-                debug!(
-                    "Updated segment manager for stream {}. URL: {}, Size: {}",
-                    stream_id, url, size
-                );
-                
-                Ok(data)
-            }
-            Err(e) => {
-                error!(
-                    "Failed to download segment for stream {} from {}: {}",
-                    stream_id, url, e
-                );
-                Err(e)
-            }
-        }
+        let bytes = self.handle_segment_download(url, stream_id).await?;
+        let size = bytes.len();
+        
+        // 更新分片管理器
+        self.segment_manager.add_segment(url.to_string(), size as u64).await;
+        debug!(
+            "Updated segment manager for stream {}. URL: {}, Size: {}",
+            stream_id, url, size
+        );
+        
+        Ok(bytes)  // 直接返回 Bytes，避免不必要的转换
     }
 
     pub async fn get_performance_metrics(&self) -> Result<PerformanceMetrics, PluginError> {
@@ -429,21 +495,40 @@ impl Plugin for HLSPlugin {
     }
 }
 
-// 为了支持后台任务的克隆
+// 为所有相关类型实现 Send + Sync
+unsafe impl Send for HLSConfig {}
+unsafe impl Sync for HLSConfig {}
+
+unsafe impl Send for HLSState {}
+unsafe impl Sync for HLSState {}
+
+unsafe impl Send for StreamInfo {}
+unsafe impl Sync for StreamInfo {}
+
+// 为 HLSPlugin 实现 Send + Sync
+unsafe impl Send for HLSPlugin {}
+unsafe impl Sync for HLSPlugin {}
+
 impl Clone for HLSPlugin {
     fn clone(&self) -> Self {
         Self {
-            config: HLSConfig {
-                cache_dir: self.config.cache_dir.clone(),
-                segment_duration: self.config.segment_duration,
-                max_segments: self.config.max_segments,
-                bandwidth_check_interval: self.config.bandwidth_check_interval,
-            },
+            config: self.config.clone(),
             state: self.state.clone(),
-            adaptive_manager: self.adaptive_manager.clone(),
             segment_manager: self.segment_manager.clone(),
-            network_manager: self.network_manager.clone(),
-            bandwidth_manager: self.bandwidth_manager.clone(),
+            cache: self.cache.clone(),
+            prefetch_tx: self.prefetch_tx.clone(),
+        }
+    }
+}
+
+// 为 HLSConfig 实现 Clone
+impl Clone for HLSConfig {
+    fn clone(&self) -> Self {
+        Self {
+            cache_dir: self.cache_dir.clone(),
+            segment_duration: self.segment_duration,
+            max_segments: self.max_segments,
+            bandwidth_check_interval: self.bandwidth_check_interval,
         }
     }
 } 

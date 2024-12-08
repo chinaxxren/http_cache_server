@@ -1,31 +1,31 @@
-use thiserror::Error;
-use std::io;
+use std::fmt;
+use std::error::Error;
 
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum PluginError {
-    #[error("IO error: {0}")]
-    Io(#[from] io::Error),
-    
-    #[error("Plugin error: {0}")]
+    Io(std::io::Error),
     Plugin(String),
-    
-    #[error("Initialization error: {0}")]
-    Init(String),
-    
-    #[error("Network error: {0}")]
     Network(String),
-    
-    #[error("Config error: {0}")]
-    Config(String),
-    
-    #[error("HLS error: {0}")]
     Hls(String),
-    
-    #[error("Storage error: {0}")]
     Storage(String),
-    
-    #[error("Security error: {0}")]
-    Security(String),
 }
 
-pub type Result<T> = std::result::Result<T, PluginError>; 
+impl fmt::Display for PluginError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PluginError::Io(e) => write!(f, "IO error: {}", e),
+            PluginError::Plugin(s) => write!(f, "Plugin error: {}", s),
+            PluginError::Network(s) => write!(f, "Network error: {}", s),
+            PluginError::Hls(s) => write!(f, "HLS error: {}", s),
+            PluginError::Storage(s) => write!(f, "Storage error: {}", s),
+        }
+    }
+}
+
+impl Error for PluginError {}
+
+impl From<std::io::Error> for PluginError {
+    fn from(err: std::io::Error) -> Self {
+        PluginError::Io(err)
+    }
+} 

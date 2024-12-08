@@ -1,7 +1,8 @@
-use http_cache_server::prelude::*;
 use std::sync::Arc;
-use tracing::{info, warn, error, debug, instrument};
 use std::time::Duration;
+use tracing::{info, warn, error, debug, instrument};
+use tracing_subscriber;
+use http_cache_server::{plugins::cache::CacheConfig, prelude::*};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,8 +14,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting HLS streaming example");
 
+    // 创建缓存管理器
+    let cache = Arc::new(CacheManager::new(
+        "./cache",
+        CacheConfig::default(),
+    ));
+
     // 初始化 HLS 插件
-    let hls_plugin = Arc::new(HLSPlugin::new("./cache".to_string()));
+    let hls_plugin = Arc::new(HLSPlugin::new(
+        "./cache".to_string(),
+        cache.clone(),
+    ));
     debug!("HLS plugin initialized");
 
     // 创建测试流
