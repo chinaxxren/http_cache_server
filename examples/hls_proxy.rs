@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for original_url in test_urls {
         info!("Testing proxy with URL: {}", original_url);
 
-        let proxy_url = proxy_server.get_proxy_url(original_url)?;
+        let proxy_url = proxy_server.get_proxy_url(original_url).await?;
         info!("Proxy URL: {}", proxy_url);
 
         let req = Request::builder()

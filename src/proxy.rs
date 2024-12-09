@@ -1,11 +1,13 @@
 use std::sync::Arc;
 use std::net::SocketAddr;
-
+use std::collections::HashMap;
+use tokio::sync::RwLock;
 use hyper::{Body, Request, Response, Server};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::server::conn::AddrStream;
 use tracing::{info, warn, error, debug};
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use crate::error::PluginError;
 use crate::plugin::Plugin;
@@ -14,6 +16,7 @@ use crate::plugins::cache::CacheManager;
 #[async_trait]
 pub trait MediaHandler: Plugin + Send + Sync {
     async fn handle_request(&self, uri: &str) -> Result<Vec<u8>, PluginError>;
+    async fn stream_request(&self, uri: &str, sender: hyper::body::Sender) -> Result<(), PluginError>;
     fn can_handle(&self, uri: &str) -> bool;
 }
 
@@ -21,6 +24,7 @@ pub struct ProxyServer {
     addr: SocketAddr,
     handlers: Vec<Arc<dyn MediaHandler>>,
     cache: Arc<CacheManager>,
+    url_mappings: Arc<RwLock<HashMap<String, String>>>, // 代理URL -> 真实URL
 }
 
 impl ProxyServer {
@@ -30,12 +34,26 @@ impl ProxyServer {
             addr,
             handlers: Vec::new(),
             cache,
+            url_mappings: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub fn add_handler(&mut self, handler: Arc<dyn MediaHandler>) {
         info!("Adding new handler: {}", handler.name());
         self.handlers.push(handler);
+    }
+
+    pub async fn get_proxy_url(&self, original_url: &str) -> Result<String, PluginError> {
+        // 生成唯一的代理路径
+        let proxy_path = Uuid::new_v4().to_string();
+        let proxy_url = format!("http://{}/{}", self.addr, proxy_path);
+        
+        // 保存映射关系
+        let mut mappings = self.url_mappings.write().await;
+        mappings.insert(proxy_path, original_url.to_string());
+        
+        info!("Created proxy mapping: {} -> {}", proxy_url, original_url);
+        Ok(proxy_url)
     }
 
     #[tracing::instrument(skip(self))]
@@ -45,6 +63,7 @@ impl ProxyServer {
 
         let handlers = self.handlers.clone();
         let cache = self.cache.clone();
+        let url_mappings = self.url_mappings.clone();
         
         let make_svc = make_service_fn(move |conn: &AddrStream| {
             let remote_addr = conn.remote_addr();
@@ -52,14 +71,14 @@ impl ProxyServer {
             
             let handlers = handlers.clone();
             let cache = cache.clone();
+            let url_mappings = url_mappings.clone();
             
             async move {
                 Ok::<_, hyper::Error>(service_fn(move |req| {
-                    debug!("Received request from {}: {} {}", 
-                        remote_addr, req.method(), req.uri());
                     let handlers = handlers.clone();
                     let cache = cache.clone();
-                    Self::handle_request(req, handlers, cache)
+                    let url_mappings = url_mappings.clone();
+                    Self::handle_request(req, handlers, cache, url_mappings)
                 }))
             }
         });
@@ -80,39 +99,56 @@ impl ProxyServer {
         req: Request<Body>,
         handlers: Vec<Arc<dyn MediaHandler>>,
         cache: Arc<CacheManager>,
+        url_mappings: Arc<RwLock<HashMap<String, String>>>,
     ) -> Result<Response<Body>, hyper::Error> {
-        let uri = req.uri().to_string();
-        info!("Processing request: {}", uri);
-        
-        for handler in handlers.iter() {
-            if handler.can_handle(&uri) {
-                info!("Handler {} will process request", handler.name());
-                match handler.handle_request(&uri).await {
-                    Ok(data) => {
-                        info!("Request processed successfully, response size: {} bytes", data.len());
-                        return Ok(Response::new(Body::from(data)));
-                    }
-                    Err(e) => {
-                        warn!("Handler {} failed: {}", handler.name(), e);
-                        continue;
+        let proxy_path = req.uri().path().trim_start_matches('/');
+        info!("Received proxy request: {}", proxy_path);
+
+        // 查找真实 URL
+        let real_url = {
+            let mappings = url_mappings.read().await;
+            mappings.get(proxy_path).cloned()
+        };
+
+        match real_url {
+            Some(real_url) => {
+                info!("Found real URL: {}", real_url);
+                
+                for handler in handlers.iter() {
+                    if handler.can_handle(&real_url) {
+                        info!("Handler {} will process request", handler.name());
+                        
+                        // 创建流式响应
+                        let (sender, body) = Body::channel();
+                        let handler = handler.clone();
+                        let real_url = real_url.clone();
+
+                        // 启动异步处理
+                        tokio::spawn(async move {
+                            match handler.stream_request(&real_url, sender).await {
+                                Ok(_) => debug!("Stream completed successfully"),
+                                Err(e) => error!("Stream error: {}", e),
+                            }
+                        });
+
+                        return Ok(Response::new(body));
                     }
                 }
+                
+                warn!("No handler found for URL: {}", real_url);
+                Ok(Response::builder()
+                    .status(404)
+                    .body(Body::from("No handler found for this request"))
+                    .unwrap())
+            }
+            None => {
+                warn!("No mapping found for proxy path: {}", proxy_path);
+                Ok(Response::builder()
+                    .status(404)
+                    .body(Body::from("Invalid proxy URL"))
+                    .unwrap())
             }
         }
-
-        warn!("No handler found for request: {}", uri);
-        Ok(Response::builder()
-            .status(404)
-            .body(Body::from("No handler found for this request"))
-            .unwrap())
-    }
-
-    pub fn get_proxy_url(&self, original_url: &str) -> Result<String, PluginError> {
-        let path = original_url.trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .trim_start_matches("//");
-            
-        Ok(format!("http://{}/{}", self.addr, path))
     }
 }
 
@@ -122,6 +158,7 @@ impl Clone for ProxyServer {
             addr: self.addr,
             handlers: self.handlers.clone(),
             cache: self.cache.clone(),
+            url_mappings: self.url_mappings.clone(),
         }
     }
 } 

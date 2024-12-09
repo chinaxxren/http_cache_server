@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
+use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetadata {
     pub content_type: String,
     pub etag: Option<String>,
@@ -19,5 +20,9 @@ impl CacheMetadata {
     pub fn with_etag(mut self, etag: String) -> Self {
         self.etag = Some(etag);
         self
+    }
+
+    pub fn content_type(&self) -> &str {
+        &self.content_type
     }
 }
