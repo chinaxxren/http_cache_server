@@ -6,6 +6,8 @@ use tokio::sync::RwLock;
 use tracing::{info, warn, error, debug};
 use tokio::io::AsyncWriteExt;
 use serde::{Serialize, Deserialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use crate::error::PluginError;
 
@@ -375,7 +377,7 @@ impl CacheManager {
 
     pub async fn store_stream(&self, key: String, metadata: CacheMetadata) -> Result<(), PluginError> {
         info!("CACHE: Creating stream for key: {}", key);
-        let file_path = self.root_path.join(&key);
+        let file_path = self.make_path(&key);
         
         // 确保父目录存在
         if let Some(parent) = file_path.parent() {
@@ -457,6 +459,81 @@ impl CacheManager {
             entry.size += chunk_size;
             state.used_space += chunk_size;
         }
+
+        Ok(())
+    }
+
+    pub fn get_path(&self, key: &str) -> PathBuf {
+        self.make_path(key)
+    }
+
+    // 添加一个辅助方法来生成哈希
+    fn hash_string(&self, s: &str) -> String {
+        let mut hasher = DefaultHasher::new();
+        s.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
+    // 修改路径生成方法
+    fn make_path(&self, key: &str) -> PathBuf {
+        // 分离前缀和路径
+        let parts: Vec<&str> = key.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return self.root_path.join(key);
+        }
+
+        let (prefix, path) = (parts[0], parts[1]);
+
+        // 处理 URL 路径
+        let clean_path = path.trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_start_matches('/');
+
+        // 生成 URL 的哈希
+        let url_hash = self.hash_string(clean_path);
+
+        // 从路径中提取文件扩展名
+        let extension = Path::new(clean_path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+
+        // 构建最终路径：/cache/prefix/url_hash.ext
+        if extension.is_empty() {
+            self.root_path.join(prefix).join(url_hash)
+        } else {
+            self.root_path.join(prefix).join(format!("{}.{}", url_hash, extension))
+        }
+    }
+
+    // 添加一个方法来保存 URL 映射
+    async fn save_url_mapping(&self, key: &str, path: &Path) -> Result<(), PluginError> {
+        let mapping_file = self.root_path.join("url_mapping.json");
+        
+        let mut mappings = if mapping_file.exists() {
+            let content = tokio::fs::read_to_string(&mapping_file).await
+                .map_err(|e| PluginError::Storage(format!("Failed to read mapping file: {}", e)))?;
+            serde_json::from_str(&content)
+                .unwrap_or_else(|_| HashMap::new())
+        } else {
+            HashMap::new()
+        };
+
+        // 保存完整的映射信息
+        let mapping_info = serde_json::json!({
+            "original_url": key,
+            "cache_path": path.to_string_lossy(),
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "type": if key.ends_with(".m3u8") { "playlist" } else { "segment" }
+        });
+
+        mappings.insert(key.to_string(), mapping_info);
+
+        let content = serde_json::to_string_pretty(&mappings)
+            .map_err(|e| PluginError::Storage(format!("Failed to serialize mappings: {}", e)))?;
+
+        tokio::fs::write(&mapping_file, content).await
+            .map_err(|e| PluginError::Storage(format!("Failed to write mapping file: {}", e)))?;
 
         Ok(())
     }
