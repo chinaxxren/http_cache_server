@@ -1,5 +1,6 @@
 # Rust 编译输出
 /target/
+/cache/
 **/*.rs.bk
 Cargo.lock
 

@@ -95,7 +95,7 @@ impl CacheManager {
         let cache_clone = Arc::new(cache.clone());
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
                 if let Err(e) = cache_clone.save_state().await {
                     error!("Failed to save cache state: {}", e);
                 }
@@ -404,6 +404,8 @@ impl CacheManager {
                 return Err(PluginError::Storage(format!("Failed to create file: {}", e)));
             }
         }
+
+        info!("CACHE: File path: {:?}", file_path);
 
         // 添加缓存条目
         let mut state = self.state.write().await;

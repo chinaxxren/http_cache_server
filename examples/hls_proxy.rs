@@ -51,9 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 测试 HLS 流
     let test_urls = vec![
-        "http://example.com/stream.m3u8",
-        "http://example.com/segment1.ts",
-        "http://example.com/segment2.ts",
+        "http://devimages.apple.com/iphone/samples/bipbop/bipbopall.m3u8",
     ];
 
     let client = Client::new();
