@@ -14,13 +14,13 @@ use http_cache_server::{
 // 测试流列表
 const TEST_STREAMS: &[(&str, &str)] = &[
     // 使用公开可用的 HLS 测试流
-    (
-        "Apple Advanced Stream",
-        "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8"
-    ),
+    // (
+    //     "Apple Advanced Stream",
+    //     "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8"
+    // ),
     (
         "Apple Basic Stream",
-        "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_4x3/bipbop_4x3_variant.m3u8"
+        "http://devimages.apple.com/iphone/samples/bipbop/bipbopall.m3u8"
     ),
 ];
 
