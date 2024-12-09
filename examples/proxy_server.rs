@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut proxy_server = ProxyServer::new(addr, cache.clone());
 
     // 添加 HLS 插件
-    let hls_plugin = Arc::new(HLSPlugin::new("./cache/hls".to_string(), cache.clone()));
+    let hls_plugin = Arc::new(HLSPlugin::new(cache.clone()));
     proxy_server.add_handler(hls_plugin);
 
     // 添加 MP4 插件

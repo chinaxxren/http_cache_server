@@ -6,39 +6,32 @@ use tracing::{info, warn, error};
 use hyper::{Body, Client, Request};
 
 use http_cache_server::{
-    plugins::cache::CacheConfig,
+    plugins::cache::{CacheManager, CacheConfig},
     plugins::mp4::MP4Plugin,
     prelude::*,
 };
 
+// 测试视频列表
 const TEST_FILES: &[(&str, &str)] = &[
-    // (
-    //     "Big Buck Bunny", 
-    //     "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
-    // ),
-    // (
-    //     "Elephants Dream",
-    //     "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4"
-    // ),
-    // (
-    //     "big_buck_bunny_720p_1mb",
-    //     "https://sample-videos.com/video321/mp4/720/big_buck_bunny_720p_1mb.mp4"
-    // ),
     (
-        "big_buck_bunny_720p_2mb",
-        "https://sample-videos.com/video321/mp4/720/big_buck_bunny_720p_2mb.mp4"
+        "Big Buck Bunny (Small)", 
+        "https://sample-videos.com/video321/mp4/240/big_buck_bunny_240p_1mb.mp4"
     ),
+    // (
+    //     "Sample Video",
+    //     "https://sample-videos.com/video321/mp4/240/sample_240p_1mb.mp4"
+    // ),
 ];
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 初始化日志，添加更多细节
+    // 初始化日志
     tracing_subscriber::fmt()
-        .with_env_filter("debug")  // 改为 debug 级别
-        .with_file(true)           // 显示文件名
-        .with_line_number(true)    // 显示行号
-        .with_thread_ids(true)     // 显示线程ID
-        .with_thread_names(true)   // 显示线程名
+        .with_env_filter("debug")
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_thread_names(true)
         .init();
     
     info!("Starting MP4 proxy example");
@@ -46,13 +39,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 创建缓存管理器
     let cache_dir = "./cache";
     info!("Creating cache directory: {}", cache_dir);
-    let cache = Arc::new(CacheManager::new(
-        cache_dir,
-        CacheConfig::default(),
-    ));
+    std::fs::create_dir_all(cache_dir)?;
+    
+    let cache_config = CacheConfig {
+        max_space: 1024 * 1024 * 1024, // 1GB
+        entry_ttl: Duration::from_secs(3600), // 1小时
+        min_free_space: 1024 * 1024 * 100, // 100MB
+    };
+    let cache = Arc::new(CacheManager::new(cache_dir, cache_config));
 
     // 创建并配置代理服务器
-    let addr: SocketAddr = "127.0.0.1:3000".parse()?;
+    let addr: SocketAddr = "127.0.0.1:3001".parse()?;
     info!("Creating proxy server on {}", addr);
     let mut proxy_server = ProxyServer::new(addr, cache.clone());
     let mp4_plugin = Arc::new(MP4Plugin::new(cache.clone()));
@@ -74,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Waiting for server to start...");
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // 测试所有 MP4 文件
+    // 测试所有视频
     for (name, url) in TEST_FILES {
         info!("=== Testing {} ===", name);
         info!("Original URL: {}", url);
