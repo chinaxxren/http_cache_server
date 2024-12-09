@@ -74,6 +74,11 @@ impl MP4Plugin {
         }
     }
 
+    pub fn hash_url(&self, uri: &str) -> String {
+        let cache_key = format!("mp4:{}", self.hash_url(uri));
+        cache_key
+    }
+
     async fn create_client(&self, uri: &str) -> hyper::Client<HttpsConnector<HttpConnector>> {
         let https = HttpsConnector::new();
         hyper::Client::builder()
@@ -82,9 +87,9 @@ impl MP4Plugin {
     }
 
     async fn handle_mp4_request(&self, uri: &str) -> Result<Vec<u8>, PluginError> {
-        let cache_key = format!("mp4:{}", uri);
-        info!("Processing MP4 request: {}", uri);
-
+        let cache_key = self.hash_url(uri);
+        info!("Processing MP4 request:{} {}", cache_key, uri);
+ 
         // 检查缓存
         match self.cache.get(&cache_key).await {
             Ok((data, _)) => {
@@ -240,7 +245,7 @@ impl Plugin for MP4Plugin {
 #[async_trait]
 impl MediaHandler for MP4Plugin {
     async fn handle_request(&self, uri: &str) -> Result<Vec<u8>, PluginError> {
-        let cache_key = format!("mp4:{}", uri);
+        let cache_key = self.hash_url(uri);
         info!("Processing MP4 request: {}", uri);
 
         // 检查缓存
@@ -261,8 +266,8 @@ impl MediaHandler for MP4Plugin {
     }
 
     async fn stream_request(&self, uri: &str, mut sender: hyper::body::Sender) -> Result<(), PluginError> {
-        let cache_key = format!("mp4:{}", uri);
-        info!("Processing MP4 stream request: {}", uri);
+        let cache_key = self.hash_url(uri);
+        info!("Processing MP4 stream request:{} {}", cache_key, uri);
 
         // 检查缓存
         match self.cache.get(&cache_key).await {

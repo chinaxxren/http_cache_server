@@ -37,7 +37,7 @@ impl HLSPlugin {
         let state = Arc::new(RwLock::new(HLSState::default()));
         let adaptive_manager = Arc::new(AdaptiveStreamManager::new());
         
-        // 创建���录结构
+        // 创建目录结构
         tokio::task::block_in_place(|| {
             if let Err(e) = std::fs::create_dir_all("cache/hls") {
                 error!("Failed to create HLS cache directory: {}", e);
@@ -235,7 +235,7 @@ impl HLSPlugin {
         let body = hyper::body::to_bytes(resp.into_body())
             .await
             .map_err(|e| PluginError::Network(e.to_string()))?;
-            
+        info!("Downloaded {} bytes from {}", body.len(), uri);
         Ok(body.to_vec())
     }
 
@@ -406,7 +406,11 @@ impl MediaHandler for HLSPlugin {
 
         // 缓存内容
         let metadata = CacheMetadata::new(self.get_content_type(uri));
-        debug!("Storing content in cache: {}", cache_key);
+        
+        // 打印返回content转为字符串内容
+        // let content_str = String::from_utf8_lossy(&content);
+        // debug!("Returning content: {}", content_str);
+        
         self.cache.store(cache_key, content.clone(), metadata).await?;
 
         Ok(content)
@@ -475,15 +479,10 @@ impl HLSPlugin {
             .unwrap_or(false)
     }
 
-    /// 检查分片是否已缓存
-    async fn is_segment_cached(&self, uri: &str) -> bool {
-        let cache_key = format!("hls:{}", uri);
-        self.cache.contains(&cache_key).await
-    }
-
     /// 生成缓存键
     fn make_cache_key(&self, uri: &str) -> String {
-        format!("hls:{}", uri)
+        let hash = self.hash_url(uri);
+        format!("hls:{}", hash)
     }
 
     fn get_content_type(&self, uri: &str) -> String {

@@ -11,3 +11,5 @@ pub mod prelude {
     pub use crate::plugins::cache::{CacheManager, CacheConfig};
     pub use crate::proxy::{ProxyServer, MediaHandler};
 } 
+
+pub use utils::{hash_url, is_absolute_url, resolve_url};
