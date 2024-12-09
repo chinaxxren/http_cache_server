@@ -5,47 +5,61 @@ use hyper::{Body, Request, Response, Server};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::server::conn::AddrStream;
 use tracing::{info, warn, error, debug};
+use async_trait::async_trait;
 
 use crate::error::PluginError;
 use crate::plugin::Plugin;
-use crate::plugins::{
-    hls::HLSPlugin,
-    cache::CacheManager,
-};
+use crate::plugins::cache::CacheManager;
 
-#[derive(Debug)]
+#[async_trait]
+pub trait MediaHandler: Plugin + Send + Sync {
+    async fn handle_request(&self, uri: &str) -> Result<Vec<u8>, PluginError>;
+    fn can_handle(&self, uri: &str) -> bool;
+}
+
 pub struct ProxyServer {
     addr: SocketAddr,
-    hls_plugin: Arc<HLSPlugin>,
+    handlers: Vec<Arc<dyn MediaHandler>>,
     cache: Arc<CacheManager>,
 }
 
 impl ProxyServer {
-    pub fn new(addr: SocketAddr, hls_plugin: Arc<HLSPlugin>, cache: Arc<CacheManager>) -> Self {
+    pub fn new(addr: SocketAddr, cache: Arc<CacheManager>) -> Self {
         info!("Creating new proxy server on {}", addr);
         Self {
             addr,
-            hls_plugin,
+            handlers: Vec::new(),
             cache,
         }
+    }
+
+    pub fn add_handler(&mut self, handler: Arc<dyn MediaHandler>) {
+        info!("Adding new handler: {}", handler.name());
+        self.handlers.push(handler);
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn run(&self) -> Result<(), PluginError> {
         info!("Starting proxy server on {}", self.addr);
+        debug!("Registered handlers: {}", self.handlers.len());
 
-        let hls_plugin = self.hls_plugin.clone();
+        let handlers = self.handlers.clone();
         let cache = self.cache.clone();
         
-        let make_svc = make_service_fn(move |_conn: &AddrStream| {
-            let hls_plugin = hls_plugin.clone();
+        let make_svc = make_service_fn(move |conn: &AddrStream| {
+            let remote_addr = conn.remote_addr();
+            info!("New connection from: {}", remote_addr);
+            
+            let handlers = handlers.clone();
             let cache = cache.clone();
             
             async move {
                 Ok::<_, hyper::Error>(service_fn(move |req| {
-                    let hls_plugin = hls_plugin.clone();
+                    debug!("Received request from {}: {} {}", 
+                        remote_addr, req.method(), req.uri());
+                    let handlers = handlers.clone();
                     let cache = cache.clone();
-                    Self::handle_request(req, hls_plugin, cache)
+                    Self::handle_request(req, handlers, cache)
                 }))
             }
         });
@@ -61,29 +75,38 @@ impl ProxyServer {
         Ok(())
     }
 
-    #[tracing::instrument(skip(hls_plugin))]
+    #[tracing::instrument(skip(handlers))]
     async fn handle_request(
         req: Request<Body>,
-        hls_plugin: Arc<HLSPlugin>,
+        handlers: Vec<Arc<dyn MediaHandler>>,
         cache: Arc<CacheManager>,
     ) -> Result<Response<Body>, hyper::Error> {
         let uri = req.uri().to_string();
+        info!("Processing request: {}", uri);
         
-        match hls_plugin.handle_hls_request(&uri).await {
-            Ok(data) => {
-                Ok(Response::new(Body::from(data)))
-            }
-            Err(e) => {
-                warn!("Failed to serve request {}: {}", uri, e);
-                Ok(Response::builder()
-                    .status(500)
-                    .body(Body::from(format!("Error: {}", e)))
-                    .unwrap())
+        for handler in handlers.iter() {
+            if handler.can_handle(&uri) {
+                info!("Handler {} will process request", handler.name());
+                match handler.handle_request(&uri).await {
+                    Ok(data) => {
+                        info!("Request processed successfully, response size: {} bytes", data.len());
+                        return Ok(Response::new(Body::from(data)));
+                    }
+                    Err(e) => {
+                        warn!("Handler {} failed: {}", handler.name(), e);
+                        continue;
+                    }
+                }
             }
         }
+
+        warn!("No handler found for request: {}", uri);
+        Ok(Response::builder()
+            .status(404)
+            .body(Body::from("No handler found for this request"))
+            .unwrap())
     }
 
-    /// 获取代理 URL
     pub fn get_proxy_url(&self, original_url: &str) -> Result<String, PluginError> {
         let path = original_url.trim_start_matches("http://")
             .trim_start_matches("https://")
@@ -93,41 +116,11 @@ impl ProxyServer {
     }
 }
 
-#[async_trait::async_trait]
-impl Plugin for ProxyServer {
-    fn name(&self) -> &str {
-        "proxy"
-    }
-
-    fn version(&self) -> &str {
-        "1.0.0"
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn init(&self) -> Result<(), PluginError> {
-        info!("Initializing proxy server plugin");
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn cleanup(&self) -> Result<(), PluginError> {
-        info!("Cleaning up proxy server plugin");
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn health_check(&self) -> Result<bool, PluginError> {
-        debug!("Performing proxy server health check");
-        // TODO: 实现实际的健康检查逻辑
-        Ok(true)
-    }
-}
-
 impl Clone for ProxyServer {
     fn clone(&self) -> Self {
         Self {
             addr: self.addr,
-            hls_plugin: self.hls_plugin.clone(),
+            handlers: self.handlers.clone(),
             cache: self.cache.clone(),
         }
     }

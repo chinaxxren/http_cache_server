@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 use async_trait::async_trait;
-use m3u8_rs::{parse_master_playlist, parse_media_playlist};
 
 use crate::error::PluginError;
 use crate::plugin::Plugin;
@@ -11,59 +10,58 @@ use crate::plugins::cache::CacheManager;
 use crate::proxy::MediaHandler;
 
 #[derive(Debug)]
-pub struct HLSPlugin {
-    state: Arc<RwLock<HLSState>>,
+pub struct MP4Plugin {
+    state: Arc<RwLock<MP4State>>,
     cache: Arc<CacheManager>,
     prefetch_tx: mpsc::Sender<String>,
 }
 
 #[derive(Debug)]
-struct HLSState {
-    segments: HashMap<String, u64>,  // URI -> total_size
+struct MP4State {
+    downloads: HashMap<String, u64>,  // URI -> total_size
 }
 
-impl Default for HLSState {
+impl Default for MP4State {
     fn default() -> Self {
         Self {
-            segments: HashMap::new(),
+            downloads: HashMap::new(),
         }
     }
 }
 
-impl HLSPlugin {
-    pub fn new(cache_dir: String, cache: Arc<CacheManager>) -> Self {
-        info!("Initializing HLSPlugin with cache directory: {}", cache_dir);
-        
+impl MP4Plugin {
+    pub fn new(cache: Arc<CacheManager>) -> Self {
+        info!("Initializing MP4Plugin");
         let (tx, mut rx) = mpsc::channel(100);
         let tx_clone = tx.clone();
         let cache_clone = cache.clone();
 
         tokio::spawn(async move {
-            debug!("Starting HLS prefetch task");
+            debug!("Starting MP4 prefetch task");
             while let Some(uri) = rx.recv().await {
                 debug!("Received prefetch request for: {}", uri);
-                let plugin = HLSPlugin {
-                    state: Arc::new(RwLock::new(HLSState::default())),
+                let plugin = MP4Plugin {
+                    state: Arc::new(RwLock::new(MP4State::default())),
                     cache: cache_clone.clone(),
                     prefetch_tx: tx_clone.clone(),
                 };
 
-                if let Err(e) = plugin.handle_hls_request(&uri).await {
+                if let Err(e) = plugin.handle_mp4_request(&uri).await {
                     warn!("Failed to prefetch {}: {}", uri, e);
                 }
             }
         });
 
         Self {
-            state: Arc::new(RwLock::new(HLSState::default())),
+            state: Arc::new(RwLock::new(MP4State::default())),
             cache,
             prefetch_tx: tx,
         }
     }
 
-    async fn handle_hls_request(&self, uri: &str) -> Result<Vec<u8>, PluginError> {
-        let cache_key = format!("hls:{}", uri);
-        info!("Processing HLS request: {}", uri);
+    async fn handle_mp4_request(&self, uri: &str) -> Result<Vec<u8>, PluginError> {
+        let cache_key = format!("mp4:{}", uri);
+        info!("Processing MP4 request: {}", uri);
 
         if let Ok((data, _)) = self.cache.get(&cache_key).await {
             info!("Cache hit for {}, size: {} bytes", uri, data.len());
@@ -94,65 +92,36 @@ impl HLSPlugin {
 
         // 更新下载统计
         let mut state = self.state.write().await;
-        state.segments.insert(uri.to_string(), total_size as u64);
+        state.downloads.insert(uri.to_string(), total_size as u64);
         info!("Download completed for {}, total size: {} bytes", uri, total_size);
 
-        if uri.ends_with(".m3u8") {
-            self.handle_playlist(&all_data, uri).await?;
-        }
-
         Ok(all_data)
-    }
-
-    async fn handle_playlist(&self, data: &[u8], uri: &str) -> Result<(), PluginError> {
-        let playlist_str = String::from_utf8_lossy(data);
-        info!("Processing playlist: {}", uri);
-        
-        if let Ok((_, master_playlist)) = parse_master_playlist(playlist_str.as_bytes()) {
-            info!("Found master playlist with {} variants", master_playlist.variants.len());
-            for variant in &master_playlist.variants {
-                info!("Prefetching variant: {}", variant.uri);
-                self.prefetch_tx.send(variant.uri.clone()).await
-                    .map_err(|e| PluginError::Plugin(format!("Failed to queue prefetch: {}", e)))?;
-            }
-        } else if let Ok((_, media_playlist)) = parse_media_playlist(playlist_str.as_bytes()) {
-            info!("Found media playlist with {} segments", media_playlist.segments.len());
-            for segment in &media_playlist.segments {
-                info!("Prefetching segment: {}", segment.uri);
-                self.prefetch_tx.send(segment.uri.clone()).await
-                    .map_err(|e| PluginError::Plugin(format!("Failed to queue prefetch: {}", e)))?;
-            }
-        } else {
-            warn!("Invalid playlist format: {}", uri);
-        }
-
-        Ok(())
     }
 }
 
 #[async_trait]
-impl Plugin for HLSPlugin {
-    fn name(&self) -> &str { "hls" }
+impl Plugin for MP4Plugin {
+    fn name(&self) -> &str { "mp4" }
     fn version(&self) -> &str { "1.0.0" }
     async fn init(&self) -> Result<(), PluginError> { Ok(()) }
     async fn cleanup(&self) -> Result<(), PluginError> { Ok(()) }
 }
 
 #[async_trait]
-impl MediaHandler for HLSPlugin {
+impl MediaHandler for MP4Plugin {
     async fn handle_request(&self, uri: &str) -> Result<Vec<u8>, PluginError> {
-        self.handle_hls_request(uri).await
+        self.handle_mp4_request(uri).await
     }
 
     fn can_handle(&self, uri: &str) -> bool {
-        uri.ends_with(".m3u8") || uri.ends_with(".ts")
+        uri.ends_with(".mp4")
     }
 }
 
-unsafe impl Send for HLSPlugin {}
-unsafe impl Sync for HLSPlugin {}
+unsafe impl Send for MP4Plugin {}
+unsafe impl Sync for MP4Plugin {}
 
-impl Clone for HLSPlugin {
+impl Clone for MP4Plugin {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),

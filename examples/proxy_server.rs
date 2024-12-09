@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::net::SocketAddr;
-use tokio::signal;
 use tracing::{info, error};
 use http_cache_server::{
     plugins::cache::CacheConfig,
@@ -12,11 +11,11 @@ use http_cache_server::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter("info")
+        .with_env_filter("debug")
         .init();
     
-    info!("Starting HTTP Cache Server");
-    
+    info!("Starting proxy server");
+
     let cache = Arc::new(CacheManager::new(
         "./cache",
         CacheConfig::default(),
@@ -26,10 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut proxy_server = ProxyServer::new(addr, cache.clone());
 
     // 添加 HLS 插件
-    let hls_plugin = Arc::new(HLSPlugin::new(
-        "./cache/hls".to_string(),
-        cache.clone(),
-    ));
+    let hls_plugin = Arc::new(HLSPlugin::new("./cache/hls".to_string(), cache.clone()));
     proxy_server.add_handler(hls_plugin);
 
     // 添加 MP4 插件
@@ -37,28 +33,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     proxy_server.add_handler(mp4_plugin);
 
     let proxy_server = Arc::new(proxy_server);
-    let server = proxy_server.clone();
 
-    // 启动服务器任务
-    let server_task = tokio::spawn(async move {
-        if let Err(e) = server.run().await {
-            error!("Server error: {}", e);
-        }
-    });
-
-    // 等待中断信号
-    match signal::ctrl_c().await {
-        Ok(()) => {
-            info!("Shutdown signal received");
-        }
-        Err(err) => {
-            error!("Unable to listen for shutdown signal: {}", err);
-        }
+    if let Err(e) = proxy_server.run().await {
+        error!("Server error: {}", e);
+        return Err(e.into());
     }
-
-    // 取消服务器任务
-    server_task.abort();
-    info!("Server shutdown completed");
 
     Ok(())
 } 
