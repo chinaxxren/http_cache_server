@@ -45,6 +45,10 @@ mod playlist {
         pub size: Option<u64>,
         /// 是否已缓存
         pub cached: bool,
+        /// 是否正在下载
+        pub downloading: bool,
+        /// 已下载字节数
+        pub bytes_downloaded: u64,
     }
 
     /// 播放列表信息
