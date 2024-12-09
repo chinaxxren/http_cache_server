@@ -1,12 +1,12 @@
 mod types;
+mod adaptive;
 
 use std::sync::Arc;
 use std::path::PathBuf;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn, error};
 use async_trait::async_trait;
-use hyper::body::HttpBody;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -19,6 +19,7 @@ use self::types::{
     HLSState, PlaylistInfo, PlaylistType, PathBuilder,
     Variant, Segment,
 };
+use self::adaptive::AdaptiveStreamManager;
 
 #[derive(Debug)]
 pub struct HLSPlugin {
@@ -26,6 +27,7 @@ pub struct HLSPlugin {
     cache: Arc<CacheManager>,
     path_builder: PathBuilder,
     prefetch_tx: mpsc::Sender<String>,
+    adaptive_manager: Arc<AdaptiveStreamManager>,
 } 
 
 impl HLSPlugin {
@@ -33,26 +35,33 @@ impl HLSPlugin {
         let (tx, mut rx) = mpsc::channel(100);
         let path_builder = PathBuilder::new("cache/hls");
         let state = Arc::new(RwLock::new(HLSState::default()));
+        let adaptive_manager = Arc::new(AdaptiveStreamManager::new());
         
-        // 创建目录结构
-        std::fs::create_dir_all("cache/hls").unwrap_or_else(|e| {
-            error!("Failed to create HLS cache directory: {}", e);
+        // 创建���录结构
+        tokio::task::block_in_place(|| {
+            if let Err(e) = std::fs::create_dir_all("cache/hls") {
+                error!("Failed to create HLS cache directory: {}", e);
+            }
         });
 
         // 加载状态
-        if let Ok(content) = std::fs::read_to_string("cache/hls/state.json") {
-            if let Ok(loaded_state) = serde_json::from_str(&content) {
-                *state.blocking_write() = loaded_state;
+        tokio::task::block_in_place(|| {
+            if let Ok(content) = std::fs::read_to_string("cache/hls/state.json") {
+                if let Ok(loaded_state) = serde_json::from_str(&content) {
+                    let mut state_guard = state.blocking_write();
+                    *state_guard = loaded_state;
+                }
             }
-        }
+        });
 
-        // 克隆发送端用于预取任务
-        let tx_clone = tx.clone();
-
-        // 启动预取任务
+        // 克隆用于任务的值
         let state_clone = state.clone();
         let cache_clone = cache.clone();
         let path_builder_clone = path_builder.clone();
+        let adaptive_manager_clone = adaptive_manager.clone();
+        let tx_clone = tx.clone();
+
+        // 启动预取任务
         tokio::spawn(async move {
             while let Some(url) = rx.recv().await {
                 debug!("Received prefetch request for {}", url);
@@ -61,9 +70,35 @@ impl HLSPlugin {
                     cache: cache_clone.clone(),
                     path_builder: path_builder_clone.clone(),
                     prefetch_tx: tx_clone.clone(),
+                    adaptive_manager: adaptive_manager_clone.clone(),
                 };
                 if let Err(e) = plugin.handle_request(&url).await {
                     warn!("Failed to prefetch {}: {}", url, e);
+                }
+            }
+        });
+
+        // 克隆用于清理任务
+        let state_clone = state.clone();
+
+        // 启动清理任务
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                let mut state = state_clone.write().await;
+                
+                // 清理过期的播放列表
+                state.playlists.retain(|_, info| {
+                    let age = chrono::Utc::now() - info.last_modified;
+                    age < chrono::Duration::hours(1)
+                });
+
+                // 清理旧的分片
+                for info in state.playlists.values_mut() {
+                    if info.segments.len() > 10 {
+                        let to_remove = info.segments.len() - 10;
+                        info.segments.drain(0..to_remove);
+                    }
                 }
             }
         });
@@ -73,6 +108,7 @@ impl HLSPlugin {
             cache,
             path_builder,
             prefetch_tx: tx,
+            adaptive_manager,
         }
     }
 
@@ -108,7 +144,7 @@ impl HLSPlugin {
         let mut info = PlaylistInfo {
             url: url.to_string(),
             hash: hash.clone(),
-            playlist_type: PlaylistType::Media, // 默认为媒体播放列表
+            playlist_type: PlaylistType::Media,
             last_modified: chrono::Utc::now(),
             target_duration: None,
             media_sequence: None,
@@ -119,6 +155,7 @@ impl HLSPlugin {
         let mut is_master = false;
         let mut current_bandwidth = None;
         let mut current_resolution = None;
+        let mut current_duration = None;
 
         for line in content_str.lines() {
             if line.starts_with("#EXT-X-STREAM-INF:") {
@@ -142,26 +179,29 @@ impl HLSPlugin {
             } else if line.starts_with("#EXTINF:") {
                 // 解析分片时长
                 if let Ok(duration) = line[8..].split(',').next().unwrap().parse() {
-                    info.segments.push(Segment {
-                        sequence: info.segments.len() as u32,
-                        duration,
-                        url: String::new(), // 下一行会填充
-                        size: None,
-                        cached: false,
-                    });
+                    current_duration = Some(duration);
                 }
             } else if !line.starts_with('#') && !line.is_empty() {
+                let line = line.trim();
                 if is_master {
                     // 添加变体流
+                    let variant_url = self.resolve_url(url, line);
                     info.variants.push(Variant {
                         bandwidth: current_bandwidth.unwrap_or(0),
                         resolution: current_resolution.take(),
-                        url: line.trim().to_string(),
-                        hash: self.hash_url(line.trim()),
+                        url: variant_url.clone(),
+                        hash: self.hash_url(&variant_url),
                     });
-                } else if let Some(segment) = info.segments.last_mut() {
-                    // 填充分片URL
-                    segment.url = line.trim().to_string();
+                } else if let Some(duration) = current_duration.take() {
+                    // 添加分片，使用绝对URL
+                    let segment_url = self.resolve_url(url, line);
+                    info.segments.push(Segment {
+                        sequence: info.segments.len() as u32,
+                        duration,
+                        url: segment_url,
+                        size: None,
+                        cached: false,
+                    });
                 }
             }
         }
@@ -173,6 +213,16 @@ impl HLSPlugin {
         };
 
         Ok((info.playlist_type.clone(), info))
+    }
+
+    /// 将相对URL转换为绝对URL
+    fn resolve_url(&self, base_url: &str, relative_url: &str) -> String {
+        if relative_url.starts_with("http://") || relative_url.starts_with("https://") {
+            relative_url.to_string()
+        } else {
+            let base = url::Url::parse(base_url).unwrap();
+            base.join(relative_url).unwrap().to_string()
+        }
     }
 
     /// 下载内容
@@ -203,6 +253,99 @@ impl HLSPlugin {
     fn get_segment_path(&self, playlist_hash: &str, variant: Option<&str>, sequence: u32) -> PathBuf {
         self.path_builder.segment(playlist_hash, variant, sequence)
     }
+
+    async fn prefetch_variants(&self, playlist_url: &str, variants: &[Variant]) -> Result<(), PluginError> {
+        // 注册新
+        self.adaptive_manager.register_stream(
+            playlist_url.to_string(),
+            1_000_000.0 // 初始带宽 1Mbps
+        ).await;
+
+        // 根据当前带宽选择体
+        let bandwidth = self.adaptive_manager.get_bandwidth(playlist_url).await;
+        let target_bandwidth = bandwidth * 0.8; // 使用80%带宽作为目标
+
+        // 选择合适的变体
+        if let Some(variant) = variants.iter()
+            .rev()
+            .find(|v| v.bandwidth as f64 <= target_bandwidth) {
+            self.prefetch_tx.send(variant.url.clone()).await
+                .unwrap_or_else(|e| warn!("Failed to schedule variant prefetch: {}", e));
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_old_segments(&self) -> Result<(), PluginError> {
+        let mut state = self.state.write().await;
+        for info in state.playlists.values_mut() {
+            if info.segments.len() > 10 { // 保留最近10个分片
+                let to_remove = info.segments.len() - 10;
+                info.segments.drain(0..to_remove);
+            }
+        }
+        self.save_state().await
+    }
+
+    fn check_cache_structure(&self) -> Result<(), PluginError> {
+        let base = self.path_builder.base_path();
+        let dirs = [
+            "playlists/master",
+            "playlists/variants",
+            "segments",
+        ];
+
+        for dir in dirs {
+            let path = base.join(dir);
+            if !path.exists() {
+                std::fs::create_dir_all(&path)
+                    .map_err(|e| PluginError::Storage(format!("Failed to create directory {}: {}", path.display(), e)))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn monitor_bandwidth(&self, uri: &str, size: usize, duration: Duration) -> Result<(), PluginError> {
+        if uri.ends_with(".ts") {
+            let playlist_url = self.get_playlist_url(uri)?;
+            let bps = (size as f64 * 8.0) / duration.as_secs_f64();
+            self.adaptive_manager.update_bandwidth(&playlist_url, bps).await;
+        }
+        Ok(())
+    }
+
+    /// 处理播放列表内容
+    async fn handle_playlist(&self, uri: &str, content: &[u8]) -> Result<(), PluginError> {
+        if let Ok((playlist_type, info)) = self.parse_playlist(content, uri).await {
+            // 更新状态
+            let mut state = self.state.write().await;
+            state.playlists.insert(info.hash.clone(), info.clone());
+            drop(state);
+            self.save_state().await?;
+
+            // 预取处理
+            match playlist_type {
+                PlaylistType::Master => {
+                    for variant in &info.variants {
+                        debug!("Scheduling variant prefetch: {}", variant.url);
+                        if let Err(e) = self.prefetch_tx.send(variant.url.clone()).await {
+                            warn!("Failed to schedule variant prefetch: {}", e);
+                        }
+                    }
+                }
+                PlaylistType::Media => {
+                    for segment in info.segments.iter().take(3) {
+                        debug!("Scheduling segment prefetch: {}", segment.url);
+                        if let Err(e) = self.prefetch_tx.send(segment.url.clone()).await {
+                            warn!("Failed to schedule segment prefetch: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 } 
 
 impl Clone for HLSPlugin {
@@ -212,6 +355,7 @@ impl Clone for HLSPlugin {
             cache: self.cache.clone(),
             path_builder: self.path_builder.clone(),
             prefetch_tx: self.prefetch_tx.clone(),
+            adaptive_manager: self.adaptive_manager.clone(),
         }
     }
 }
@@ -228,6 +372,7 @@ impl Plugin for HLSPlugin {
 
     async fn init(&self) -> Result<(), PluginError> {
         info!("Initializing HLS plugin");
+        self.check_cache_structure()?;
         Ok(())
     }
 
@@ -241,10 +386,10 @@ impl Plugin for HLSPlugin {
 impl MediaHandler for HLSPlugin {
     async fn handle_request(&self, uri: &str) -> Result<Vec<u8>, PluginError> {
         debug!("Handling HLS request: {}", uri);
-        let hash = self.hash_url(uri);
+        
+        let cache_key = self.make_cache_key(uri);
         
         // 检查缓存
-        let cache_key = format!("hls:{}", uri);
         if let Ok((data, _)) = self.cache.get(&cache_key).await {
             debug!("Cache hit for {}", uri);
             return Ok(data);
@@ -256,70 +401,96 @@ impl MediaHandler for HLSPlugin {
 
         // 处理播放列表
         if uri.ends_with(".m3u8") {
-            let (playlist_type, info) = self.parse_playlist(&content, uri).await?;
-            
-            // 更新状态
-            let mut state = self.state.write().await;
-            state.playlists.insert(hash.clone(), info);
-            self.save_state().await?;
-
-            // 预取变体流或分片
-            match playlist_type {
-                PlaylistType::Master => {
-                    // 预取所有变体流
-                    if let Some(info) = state.playlists.get(&hash) {
-                        for variant in &info.variants {
-                            self.prefetch_tx.send(variant.url.clone()).await
-                                .unwrap_or_else(|e| warn!("Failed to schedule variant prefetch: {}", e));
-                        }
-                    }
-                }
-                PlaylistType::Media => {
-                    // 预取前几个分片
-                    if let Some(info) = state.playlists.get(&hash) {
-                        for segment in info.segments.iter().take(3) {
-                            self.prefetch_tx.send(segment.url.clone()).await
-                                .unwrap_or_else(|e| warn!("Failed to schedule segment prefetch: {}", e));
-                        }
-                    }
-                }
-            }
+            self.handle_playlist(uri, &content).await?;
         }
 
         // 缓存内容
-        let metadata = CacheMetadata::new(
-            if uri.ends_with(".m3u8") {
-                "application/vnd.apple.mpegurl"
-            } else {
-                "video/mp2t"
-            }.to_string()
-        );
+        let metadata = CacheMetadata::new(self.get_content_type(uri));
+        debug!("Storing content in cache: {}", cache_key);
         self.cache.store(cache_key, content.clone(), metadata).await?;
 
         Ok(content)
     }
 
-    fn can_handle(&self, uri: &str) -> bool {
-        uri.ends_with(".m3u8") || uri.ends_with(".ts")
-    }
-
     async fn stream_request(&self, uri: &str, mut sender: hyper::body::Sender) -> Result<(), PluginError> {
-        let content = self.handle_request(uri).await?;
+        let cache_key = format!("hls:{}", uri);
         
-        // 分块发送
-        const CHUNK_SIZE: usize = 64 * 1024;  // 64KB chunks
-        let mut offset = 0;
-        
-        while offset < content.len() {
-            let end = (offset + CHUNK_SIZE).min(content.len());
-            let chunk = content[offset..end].to_vec();
-            
-            sender.send_data(bytes::Bytes::from(chunk)).await
-                .map_err(|e| PluginError::Network(format!("Failed to send chunk: {}", e)))?;
-                
-            offset = end;
+        match self.cache.get(&cache_key).await {
+            Ok((data, _)) => {
+                debug!("Cache hit for streaming {}", uri);
+                sender.send_data(bytes::Bytes::from(data)).await
+                    .map_err(|e| PluginError::Network(format!("Failed to send cached data: {}", e)))?;
+            }
+            Err(_) => {
+                debug!("Cache miss for streaming {}, downloading...", uri);
+                let content = self.handle_request(uri).await?;
+                sender.send_data(bytes::Bytes::from(content)).await
+                    .map_err(|e| PluginError::Network(format!("Failed to send data: {}", e)))?;
+            }
         }
 
         Ok(())
+    }
+
+    fn can_handle(&self, uri: &str) -> bool {
+        uri.ends_with(".m3u8") || uri.ends_with(".ts")
+    }
+} 
+
+impl HLSPlugin {
+    /// 获取播放列表URL
+    fn get_playlist_url(&self, segment_url: &str) -> Result<String, PluginError> {
+        let state = self.state.blocking_read();
+        for info in state.playlists.values() {
+            if info.segments.iter().any(|s| s.url == segment_url) {
+                return Ok(info.url.clone());
+            }
+        }
+        Err(PluginError::Hls(format!("Cannot find playlist for segment: {}", segment_url)))
+    }
+
+    /// 从URL中提取序列号
+    fn extract_sequence_number(&self, uri: &str) -> Result<u32, PluginError> {
+        uri.split('/')
+            .last()
+            .and_then(|s| s.split('.').next())
+            .and_then(|s| s.replace("segment", "").parse().ok())
+            .ok_or_else(|| PluginError::Hls(format!("Invalid segment URL: {}", uri)))
+    }
+
+    /// 获取变体名称
+    fn get_variant_name(&self, uri: &str) -> Option<String> {
+        uri.split('/')
+            .rev()
+            .nth(1)
+            .map(|s| s.to_string())
+    }
+
+    /// 检查是否为主播放列表
+    fn is_master_playlist(&self, uri: &str) -> bool {
+        let state = self.state.blocking_read();
+        let hash = self.hash_url(uri);
+        state.playlists.get(&hash)
+            .map(|info| matches!(info.playlist_type, PlaylistType::Master))
+            .unwrap_or(false)
+    }
+
+    /// 检查分片是否已缓存
+    async fn is_segment_cached(&self, uri: &str) -> bool {
+        let cache_key = format!("hls:{}", uri);
+        self.cache.contains(&cache_key).await
+    }
+
+    /// 生成缓存键
+    fn make_cache_key(&self, uri: &str) -> String {
+        format!("hls:{}", uri)
+    }
+
+    fn get_content_type(&self, uri: &str) -> String {
+        if uri.ends_with(".m3u8") {
+            "application/vnd.apple.mpegurl".to_string()
+        } else {
+            "video/mp2t".to_string()
+        }
     }
 } 

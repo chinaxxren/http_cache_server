@@ -1,31 +1,30 @@
 use std::fmt;
-use std::error::Error;
+use thiserror::Error;
+use crate::plugins::cache::CacheError;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum PluginError {
-    Io(std::io::Error),
-    Plugin(String),
+    #[error("Network error: {0}")]
     Network(String),
-    Hls(String),
+
+    #[error("Storage error: {0}")]
     Storage(String),
-}
 
-impl fmt::Display for PluginError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PluginError::Io(e) => write!(f, "IO error: {}", e),
-            PluginError::Plugin(s) => write!(f, "Plugin error: {}", s),
-            PluginError::Network(s) => write!(f, "Network error: {}", s),
-            PluginError::Hls(s) => write!(f, "HLS error: {}", s),
-            PluginError::Storage(s) => write!(f, "Storage error: {}", s),
-        }
-    }
-}
+    #[error("HLS error: {0}")]
+    Hls(String),
 
-impl Error for PluginError {}
+    #[error("MP4 error: {0}")]
+    Mp4(String),
+
+    #[error("Cache error: {0}")]
+    Cache(#[from] CacheError),
+
+    #[error("Other error: {0}")]
+    Other(String),
+}
 
 impl From<std::io::Error> for PluginError {
     fn from(err: std::io::Error) -> Self {
-        PluginError::Io(err)
+        PluginError::Storage(err.to_string())
     }
 } 

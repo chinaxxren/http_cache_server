@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -70,10 +70,10 @@ mod playlist {
 }
 
 mod path {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// 缓存路径生成器
-    #[derive(Debug, Clone)]  // 添加 Clone 实现
+    #[derive(Debug, Clone)]
     pub struct PathBuilder {
         base_path: PathBuf,
     }
@@ -85,10 +85,15 @@ mod path {
             }
         }
 
+        pub fn base_path(&self) -> &Path {
+            &self.base_path
+        }
+
         /// 获取主播放列表路径
         pub fn master_playlist(&self, hash: &str) -> PathBuf {
             self.base_path
                 .join(hash)
+                .join("playlists")
                 .join("master.m3u8")
         }
 
@@ -96,6 +101,7 @@ mod path {
         pub fn variant_playlist(&self, master_hash: &str, variant_name: &str) -> PathBuf {
             self.base_path
                 .join(master_hash)
+                .join("playlists")
                 .join("variants")
                 .join(format!("{}.m3u8", variant_name))
         }
@@ -104,6 +110,7 @@ mod path {
         pub fn media_playlist(&self, hash: &str) -> PathBuf {
             self.base_path
                 .join(hash)
+                .join("playlists")
                 .join("playlist.m3u8")
         }
 

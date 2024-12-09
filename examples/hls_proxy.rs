@@ -3,7 +3,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::signal;
 use tracing::{info, warn, error};
-use hyper::{Body, Client, Request};
 
 use http_cache_server::{
     plugins::cache::{CacheManager, CacheConfig},
@@ -13,14 +12,10 @@ use http_cache_server::{
 
 // 测试流列表
 const TEST_STREAMS: &[(&str, &str)] = &[
-    // 使用公开可用的 HLS 测试流
-    // (
-    //     "Apple Advanced Stream",
-    //     "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8"
-    // ),
     (
         "Apple Basic Stream",
-        "http://devimages.apple.com/iphone/samples/bipbop/bipbopall.m3u8"
+        "http://devimages.apple.com/iphone/samples/bipbop/bipbopall.m3u8",
+        // "http://playertest.longtailvideo.com/adaptive/bipbop/gear4/prog_index.m3u8"
     ),
 ];
 
@@ -43,8 +38,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(cache_dir)?;
     
     let cache_config = CacheConfig {
-        max_space: 1024 * 1024 * 1024, // 1GB
-        entry_ttl: Duration::from_secs(3600), // 1小时
+        max_space: 10 * 1024 * 1024 * 1024, // 10GB
+        entry_ttl: Duration::from_secs(3600 * 24), // 24小时
         min_free_space: 1024 * 1024 * 100, // 100MB
     };
     let cache = Arc::new(CacheManager::new(cache_dir, cache_config));
@@ -84,10 +79,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 创建客户端请求
         info!("Creating request for {}", name);
-        let client = Client::new();
-        let req = Request::builder()
+        let client = hyper::Client::new();
+        let req = hyper::Request::builder()
             .uri(proxy_url.clone())
-            .body(Body::empty())?;
+            .body(hyper::Body::empty())?;
 
         // 发送请求到代理服务器
         info!("Sending request to proxy for {}", name);

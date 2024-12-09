@@ -1,541 +1,445 @@
-use std::collections::HashMap;
+pub mod error;
+
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::collections::HashMap;
 use tokio::sync::RwLock;
-use tracing::{info, warn, error, debug};
-use tokio::io::AsyncWriteExt;
 use serde::{Serialize, Deserialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use chrono::{DateTime, Utc};
+use tracing::{info, warn, error};
+use std::time::Instant;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 
 use crate::error::PluginError;
+pub use self::error::CacheError;
 
-mod entry;
-mod metadata;
-
-pub use metadata::CacheMetadata;
-use entry::CacheEntry;
-
-#[derive(Debug)]
-pub struct CacheManager {
-    root_path: PathBuf,
-    state: Arc<RwLock<CacheState>>,
-    config: CacheConfig,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheMetadata {
+    pub content_type: String,
+    pub last_modified: Option<DateTime<Utc>>,
+    pub etag: Option<String>,
 }
 
-impl Clone for CacheManager {
-    fn clone(&self) -> Self {
+impl CacheMetadata {
+    pub fn new(content_type: String) -> Self {
         Self {
-            root_path: self.root_path.clone(),
-            state: self.state.clone(),
-            config: self.config.clone(),
+            content_type,
+            last_modified: None,
+            etag: None,
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct CacheState {
-    entries: HashMap<String, CacheEntry>,
-    used_space: u64,
-    max_space: u64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheEntry {
+    pub path: PathBuf,
+    pub size: u64,
+    pub last_access: DateTime<Utc>,
+    pub metadata: CacheMetadata,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CacheConfig {
-    pub max_space: u64,
-    pub entry_ttl: Duration,
-    pub min_free_space: u64,
+    pub max_space: u64,        // 最大缓存空间(字节)
+    pub entry_ttl: Duration,   // 缓存项有效期
+    pub min_free_space: u64,   // 最小剩余空间(字节)
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            max_space: 1024 * 1024 * 1024, // 1GB
-            entry_ttl: Duration::from_secs(86400), // 24 hours
-            min_free_space: 1024 * 1024 * 100, // 100MB
+            max_space: 1024 * 1024 * 1024,  // 1GB
+            entry_ttl: Duration::from_secs(3600 * 24),  // 24小时
+            min_free_space: 1024 * 1024 * 100,  // 100MB
         }
     }
 }
 
-impl CacheManager {
-    pub fn new<P: AsRef<Path>>(root_path: P, config: CacheConfig) -> Self {
-        info!("Initializing cache manager with root path: {:?}", root_path.as_ref());
-        debug!("Cache config: {:?}", config);
-
-        let root_path = root_path.as_ref().to_owned();
-        
-        // 确保缓存目录存在
-        tokio::task::block_in_place(|| {
-            std::fs::create_dir_all(&root_path)
-                .unwrap_or_else(|e| warn!("Failed to create cache directory: {}", e));
-        });
-
-        // 尝试加载缓存状态
-        let state = Self::load_state(&root_path).unwrap_or_else(|e| {
-            warn!("Failed to load cache state: {}, creating new state", e);
-            CacheState {
-                entries: HashMap::new(),
-                used_space: 0,
-                max_space: config.max_space,
-            }
-        });
-
-        info!("Loaded cache state: {} entries, {} bytes used", 
-            state.entries.len(), state.used_space);
-
-        // 验证缓存文件
-        let state = Self::verify_cache_files(state, &root_path);
-        
-        let cache = Self {
-            root_path,
-            state: Arc::new(RwLock::new(state)),
-            config,
-        };
-
-        // 启动定期保存状态的任务
-        let cache_clone = Arc::new(cache.clone());
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                if let Err(e) = cache_clone.save_state().await {
-                    error!("Failed to save cache state: {}", e);
-                }
-            }
-        });
-
-        cache
-    }
-
-    fn load_state(root_path: &Path) -> Result<CacheState, PluginError> {
-        let state_file = root_path.join("cache_state.json");
-        if !state_file.exists() {
-            return Err(PluginError::Storage("State file not found".into()));
+impl CacheConfig {
+    pub fn validate(&self) -> Result<(), CacheError> {
+        if self.max_space < self.min_free_space {
+            return Err(CacheError::Other(
+                "max_space must be greater than min_free_space".into()
+            ));
         }
 
-        let content = std::fs::read_to_string(&state_file)
-            .map_err(|e| PluginError::Storage(format!("Failed to read state file: {}", e)))?;
+        if self.entry_ttl.as_secs() == 0 {
+            return Err(CacheError::Other(
+                "entry_ttl must be greater than zero".into()
+            ));
+        }
 
-        serde_json::from_str(&content)
-            .map_err(|e| PluginError::Storage(format!("Failed to parse state file: {}", e)))
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheState {
+    total_size: u64,
+    used_size: u64,
+    max_size: u64,
+    entries: HashMap<String, CacheEntry>,
+}
+
+pub struct CacheManager {
+    base_path: PathBuf,
+    config: CacheConfig,
+    state: RwLock<CacheState>,
+}
+
+impl CacheManager {
+    pub fn new<P: AsRef<Path>>(base_path: P, config: CacheConfig) -> Self {
+        // 创建缓存目录
+        std::fs::create_dir_all(&base_path).unwrap_or_else(|e| {
+            error!("Failed to create cache directory: {}", e);
+        });
+
+        // 加载状态
+        let state = if let Ok(content) = std::fs::read_to_string(base_path.as_ref().join("cache_state.json")) {
+            serde_json::from_str(&content).unwrap_or_else(|e| {
+                warn!("Failed to parse cache state: {}", e);
+                CacheState {
+                    total_size: 0,
+                    used_size: 0,
+                    max_size: config.max_space,
+                    entries: HashMap::new(),
+                }
+            })
+        } else {
+            CacheState {
+                total_size: 0,
+                used_size: 0,
+                max_size: config.max_space,
+                entries: HashMap::new(),
+            }
+        };
+
+        Self {
+            base_path: base_path.as_ref().to_path_buf(),
+            config,
+            state: RwLock::new(state),
+        }
     }
 
-    fn verify_cache_files(mut state: CacheState, root_path: &Path) -> CacheState {
-        let mut verified_entries = HashMap::new();
-        let mut total_size = 0;
+    pub async fn get(&self, key: &str) -> Result<(Vec<u8>, CacheMetadata), CacheError> {
+        let mut state = self.state.write().await;
+        if let Some(entry) = state.entries.get_mut(key) {
+            // 更新访问时间
+            entry.last_access = Utc::now();
+            
+            // 读取文件内容
+            let content = tokio::fs::read(&entry.path).await?;
+            Ok((content, entry.metadata.clone()))
+        } else {
+            Err(CacheError::NotFound(key.to_string()))
+        }
+    }
 
-        for (key, entry) in state.entries {
-            if entry.path.exists() {
-                match std::fs::metadata(&entry.path) {
-                    Ok(metadata) => {
-                        let actual_size = metadata.len();
-                        if actual_size != entry.size {
-                            warn!("Cache file size mismatch for {}: expected {}, actual {}", 
-                                key, entry.size, actual_size);
-                            // 更新为实际大小
-                            let mut entry_clone = entry.clone();
-                            entry_clone.size = actual_size;
-                            verified_entries.insert(key, entry_clone);
-                            total_size += actual_size;
-                        } else {
-                            verified_entries.insert(key.clone(), entry.clone());
-                            total_size += entry.size;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to read cache file metadata for {}: {}", key, e);
-                        continue;
-                    }
-                }
-            } else {
-                warn!("Cache file missing for key: {}, path: {:?}", key, entry.path);
+    pub async fn store(&self, key: String, content: Vec<u8>, metadata: CacheMetadata) -> Result<(), CacheError> {
+        let size = content.len() as u64;
+        
+        // 检查空间
+        self.ensure_space(size).await?;
+
+        // 生成文件路径
+        let path = self.base_path.join(format!("{}.cache", key));
+        self.validate_path(&path)?;
+
+        // 写入文件
+        tokio::fs::write(&path, &content).await?;
+
+        // 更新状态
+        let mut state = self.state.write().await;
+        state.entries.insert(key, CacheEntry {
+            path,
+            size,
+            last_access: Utc::now(),
+            metadata,
+        });
+        state.used_size += size;
+
+        // 保存状态
+        drop(state);
+        self.save_state().await?;
+
+        Ok(())
+    }
+
+    async fn cleanup_space(&self, needed_space: u64) -> Result<(), CacheError> {
+        let mut state = self.state.write().await;
+        
+        // 先收集要删除的条目
+        let mut to_remove = Vec::new();
+        let mut freed_space = 0;
+        
+        // 按最后访问时间排序
+        let mut entries: Vec<_> = state.entries.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.1.last_access.cmp(&b.1.last_access));
+
+        // 标记要删除的条目
+        for (key, entry) in entries {
+            if state.used_size - freed_space + needed_space <= self.config.max_space {
+                break;
+            }
+
+            // 删除文件
+            if let Err(e) = tokio::fs::remove_file(&entry.path).await {
+                warn!("Failed to remove cache file {}: {}", entry.path.display(), e);
+            }
+
+            to_remove.push(key);
+            freed_space += entry.size;
+        }
+
+        // 批量删除条目
+        for key in to_remove {
+            state.entries.remove(&key);
+        }
+
+        state.used_size -= freed_space;
+        self.save_state().await?;
+
+        Ok(())
+    }
+
+    async fn save_state(&self) -> Result<(), CacheError> {
+        let state = self.state.read().await;
+        let content = serde_json::to_string_pretty(&*state)?;
+
+        let temp_path = self.base_path.join("cache_state.json.tmp");
+        let final_path = self.base_path.join("cache_state.json");
+
+        tokio::fs::write(&temp_path, &content).await?;
+        tokio::fs::rename(temp_path, final_path).await?;
+
+        Ok(())
+    }
+
+    pub async fn cleanup(&self) -> Result<(), CacheError> {
+        let mut state = self.state.write().await;
+        let now = Utc::now();
+        let mut to_remove = Vec::new();
+        let mut freed_space = 0;
+
+        // 检查过期和无效的条目
+        for (key, entry) in state.entries.iter() {
+            // 检查 TTL
+            let age = now - entry.last_access;
+            if age > chrono::Duration::from_std(self.config.entry_ttl).unwrap() {
+                to_remove.push(key.clone());
+                freed_space += entry.size;
+                continue;
+            }
+
+            // 检查文件是否存在
+            if !entry.path.exists() {
+                to_remove.push(key.clone());
+                freed_space += entry.size;
                 continue;
             }
         }
 
-        CacheState {
-            entries: verified_entries,
-            used_space: total_size,
-            max_space: state.max_space,
-        }
-    }
-
-    async fn save_state(&self) -> Result<(), PluginError> {
-        let state = self.state.read().await;
-        let state_file = self.root_path.join("cache_state.json");
-        let temp_file = state_file.with_extension("tmp");
-
-        // 先写入临时文件
-        let content = serde_json::to_string_pretty(&*state)
-            .map_err(|e| PluginError::Storage(format!("Failed to serialize state: {}", e)))?;
-
-        tokio::fs::write(&temp_file, content).await
-            .map_err(|e| PluginError::Storage(format!("Failed to write state file: {}", e)))?;
-
-        // 原子地重命名
-        tokio::fs::rename(&temp_file, &state_file).await
-            .map_err(|e| PluginError::Storage(format!("Failed to save state file: {}", e)))?;
-
-        debug!("Cache state saved successfully");
-        Ok(())
-    }
-
-    pub async fn store(&self, key: String, data: Vec<u8>, metadata: CacheMetadata) -> Result<(), PluginError> {
-        debug!("Attempting to store {} bytes for key: {}", data.len(), key);
-        let mut state = self.state.write().await;
-
-        // 检查空间
-        let size = data.len() as u64;
-        if state.used_space + size > state.max_space {
-            return Err(PluginError::Storage("Cache space exceeded".into()));
-        }
-
-        // 存储文件
-        let file_path = self.root_path.join(&key);
-        match tokio::fs::write(&file_path, &data).await {
-            Ok(_) => {
-                state.entries.insert(key.clone(), CacheEntry {
-                    path: file_path.clone(),
-                    size,
-                    last_access: Instant::now(),
-                    metadata,
-                });
-                state.used_space += size;
-                info!("Successfully stored {} bytes for key: {}", size, key);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to store data for key {}: {}", key, e);
-                Err(PluginError::Storage(e.to_string()))
-            }
-        }
-    }
-
-    pub async fn get(&self, key: &str) -> Result<(Vec<u8>, CacheMetadata), PluginError> {
-        debug!("Attempting to retrieve key: {}", key);
-        
-        // 先检查文件和条目是否存在，并获取必要信息
-        let cache_info = {
-            let mut state = self.state.write().await;
-            
-            // 先获取条目的引用
-            let entry = state.entries.get(key);  // 使用 get 而不是 get_mut
-            
-            match entry {
-                Some(entry) => {
-                    debug!("Found cache entry for key: {}, size: {}, path: {:?}", 
-                        key, entry.size, entry.path);
-                    
-                    // 检查文件是否存在
-                    if !entry.path.exists() {
-                        warn!("Cache file missing for key: {}, path: {:?}", key, entry.path);
-                        let size = entry.size;
-                        let path = entry.path.clone();
-                        // 删除条目并更新空间
-                        state.entries.remove(key);
-                        state.used_space -= size;
-                        return Err(PluginError::Storage(format!("Cache file missing: {:?}", path)));
-                    }
-
-                    // 检查文件权限
-                    match std::fs::metadata(&entry.path) {
-                        Ok(metadata) => {
-                            debug!("Cache file metadata: readonly={}, size={}, modified={:?}", 
-                                metadata.permissions().readonly(),
-                                metadata.len(),
-                                metadata.modified().ok());
-                        }
-                        Err(e) => {
-                            warn!("Failed to read cache file metadata: {}, path: {:?}", e, entry.path);
-                        }
-                    }
-
-                    // 检查 TTL
-                    if entry.is_expired(self.config.entry_ttl) {
-                        warn!("Cache entry expired for key: {}, last_access: {:?}", 
-                            key, entry.last_access);
-                        let path = entry.path.clone();
-                        let size = entry.size;
-                        // 删除条目并更新空间
-                        state.entries.remove(key);
-                        state.used_space -= size;
-                        
-                        // 删除过期文件
-                        if let Err(e) = tokio::fs::remove_file(&path).await {
-                            warn!("Failed to remove expired cache file: {}, path: {:?}", e, path);
-                        }
-                        
-                        return Err(PluginError::Storage("Cache entry expired".into()));
-                    }
-
-                    // 克隆需要的数据
-                    let info = CacheInfo {
-                        path: entry.path.clone(),
-                        metadata: entry.metadata.clone(),
-                        size: entry.size,
-                    };
-
-                    // 更新访问时间
-                    if let Some(entry) = state.entries.get_mut(key) {
-                        entry.touch();
-                        debug!("Updated last_access time for key: {}", key);
-                    }
-
-                    info
-                }
-                None => {
-                    debug!("Cache miss for key: {}, no entry found in cache state", key);
-                    return Err(PluginError::Storage("Cache miss".into()));
-                }
-            }
-        };
-
-        // 读取文件
-        debug!("Reading cache file: {:?}", cache_info.path);
-        match tokio::fs::read(&cache_info.path).await {
-            Ok(data) => {
-                info!("Successfully retrieved {} bytes for key: {} from {:?}", 
-                    data.len(), key, cache_info.path);
-                Ok((data, cache_info.metadata))
-            }
-            Err(e) => {
-                error!("Failed to read cache file for key {}: {}, path: {:?}", 
-                    key, e, cache_info.path);
-                // 如果文件读取失败，清理缓存条目
-                let mut state = self.state.write().await;
-                if let Some(entry) = state.entries.remove(key) {
-                    state.used_space -= entry.size;
-                    warn!("Removed cache entry due to read failure, freed {} bytes", entry.size);
-                }
-                Err(PluginError::Storage(format!("Failed to read cache file: {}", e)))
-            }
-        }
-    }
-
-    pub async fn cleanup(&self) -> Result<(), PluginError> {
-        info!("Starting cache cleanup");
-        let mut state = self.state.write().await;
-        let now = Instant::now();
-        let mut removed_count = 0;
-        let mut freed_space = 0;
-
-        // 找出过期条目
-        let expired: Vec<_> = state.entries.iter()
-            .filter(|(_, entry)| now.duration_since(entry.last_access) > self.config.entry_ttl)
-            .map(|(k, _)| k.clone())
-            .collect();
-
-        debug!("Found {} expired entries", expired.len());
-
         // 删除过期条目
-        for key in expired {
+        for key in to_remove {
             if let Some(entry) = state.entries.remove(&key) {
-                match tokio::fs::remove_file(&entry.path).await {
-                    Ok(_) => {
-                        state.used_space -= entry.size;
-                        freed_space += entry.size;
-                        removed_count += 1;
-                        debug!("Removed expired entry: {}", key);
-                    }
-                    Err(e) => warn!("Failed to remove cache file {}: {}", key, e),
+                if let Err(e) = tokio::fs::remove_file(&entry.path).await {
+                    warn!("Failed to remove cache file {}: {}", entry.path.display(), e);
                 }
             }
         }
 
-        info!("Cache cleanup completed. Removed {} entries, freed {} bytes", 
-            removed_count, freed_space);
+        // 更新使用空间
+        state.used_size -= freed_space;
+
+        // 保存状态
+        drop(state);
+        self.save_state().await?;
+
         Ok(())
     }
 
     pub async fn get_stats(&self) -> CacheStats {
         let state = self.state.read().await;
-        let stats = CacheStats {
+        CacheStats {
             total_entries: state.entries.len(),
-            used_space: state.used_space,
-            max_space: state.max_space,
-            usage_percent: (state.used_space as f64 / state.max_space as f64) * 100.0,
+            used_space: state.used_size,
+            max_space: state.max_size,
+            usage_percent: (state.used_size as f64 / state.max_size as f64) * 100.0,
             last_cleanup: Instant::now(),
-        };
-        debug!("Cache stats: {:?}", stats);
-        stats
+        }
     }
 
-    pub async fn start_cleanup_task(self: Arc<Self>) {
-        info!("Starting cache cleanup task");
-        let cleanup_interval = self.config.entry_ttl;
-
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(cleanup_interval).await;
-                debug!("Running scheduled cleanup");
-                if let Err(e) = self.cleanup().await {
-                    error!("Error during cleanup: {}", e);
-                }
-            }
-        });
-    }
-
-    pub async fn store_stream(&self, key: String, metadata: CacheMetadata) -> Result<(), PluginError> {
-        info!("CACHE: Creating stream for key: {}", key);
-        let file_path = self.make_path(&key);
+    pub async fn clear(&self) -> Result<(), CacheError> {
+        let mut state = self.state.write().await;
         
-        // 确保父目录存在
-        if let Some(parent) = file_path.parent() {
-            info!("CACHE: Creating directory: {:?}", parent);
-            tokio::fs::create_dir_all(parent).await
-                .map_err(|e| {
-                    error!("CACHE: Failed to create directory {:?}: {}", parent, e);
-                    PluginError::Storage(format!("Failed to create directory: {}", e))
-                })?;
+        // 删除所有缓存文件
+        for entry in state.entries.values() {
+            if let Err(e) = tokio::fs::remove_file(&entry.path).await {
+                warn!("Failed to remove cache file {}: {}", entry.path.display(), e);
+            }
+        }
+
+        // 清空状态
+        state.entries.clear();
+        state.used_size = 0;
+
+        // 保存状态
+        drop(state);
+        self.save_state().await?;
+
+        Ok(())
+    }
+
+    pub async fn remove(&self, key: &str) -> Result<(), CacheError> {
+        let mut state = self.state.write().await;
+        
+        if let Some(entry) = state.entries.remove(key) {
+            // 删除文件
+            if let Err(e) = tokio::fs::remove_file(&entry.path).await {
+                warn!("Failed to remove cache file {}: {}", entry.path.display(), e);
+            }
+            
+            // 更新使用空间
+            state.used_size -= entry.size;
+
+            // 保存状态
+            drop(state);
+            self.save_state().await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn contains(&self, key: &str) -> bool {
+        let state = self.state.read().await;
+        state.entries.contains_key(key)
+    }
+
+    pub async fn get_metadata(&self, key: &str) -> Option<CacheMetadata> {
+        let state = self.state.read().await;
+        state.entries.get(key).map(|e| e.metadata.clone())
+    }
+
+    pub fn validate_config(&self) -> Result<(), CacheError> {
+        if self.config.max_space < self.config.min_free_space {
+            return Err(CacheError::Other(
+                "max_space must be greater than min_free_space".into()
+            ));
+        }
+
+        if self.config.entry_ttl.as_secs() == 0 {
+            return Err(CacheError::Other(
+                "entry_ttl must be greater than zero".into()
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_path(&self, path: &Path) -> Result<(), CacheError> {
+        if !path.starts_with(&self.base_path) {
+            return Err(CacheError::InvalidPath(
+                format!("Path {} is outside cache directory", path.display())
+            ));
+        }
+        Ok(())
+    }
+
+    async fn ensure_space(&self, needed: u64) -> Result<(), CacheError> {
+        let state = self.state.read().await;
+        let available = self.config.max_space - state.used_size;
+        
+        if needed > available {
+            return Err(CacheError::Full {
+                needed,
+                available,
+            });
+        }
+        Ok(())
+    }
+
+    /// 创建流式缓存
+    pub async fn store_stream(&self, key: String, metadata: CacheMetadata) -> Result<(), CacheError> {
+        // 生成文件路径
+        let path = self.base_path.join(format!("{}.cache", key));
+        self.validate_path(&path)?;
+
+        // 创建目录
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
         }
 
         // 创建文件
-        info!("CACHE: Creating file: {:?}", file_path);
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&file_path)
-            .await
-        {
-            Ok(_) => {
-                info!("CACHE: Successfully created file: {:?}", file_path);
-            }
-            Err(e) => {
-                error!("CACHE: Failed to create file {:?}: {}", file_path, e);
-                return Err(PluginError::Storage(format!("Failed to create file: {}", e)));
-            }
-        }
+        File::create(&path).await?;
 
-        info!("CACHE: File path: {:?}", file_path);
-
-        // 添加缓存条目
+        // 更新状态
         let mut state = self.state.write().await;
-        state.entries.insert(key.clone(), CacheEntry {
-            path: file_path.clone(),
+        state.entries.insert(key, CacheEntry {
+            path,
             size: 0,
-            last_access: Instant::now(),
+            last_access: Utc::now(),
             metadata,
         });
-        info!("CACHE: Added new cache entry for key: {}", key);
+
+        // 保存状态
+        drop(state);
+        self.save_state().await?;
 
         Ok(())
     }
 
-    pub async fn append_chunk(&self, key: &str, chunk: &[u8]) -> Result<(), PluginError> {
-        debug!("Appending {} bytes to cache key: {}", chunk.len(), key);
-
-        // First, get the entry path and check space without holding a mutable reference
-        let (entry_path, max_space, current_used_space) = {
-            let state = self.state.read().await;
-            match state.entries.get(key) {
-                Some(entry) => (entry.path.clone(), self.config.max_space, state.used_space),
-                None => return Err(PluginError::Storage("Cache entry not found".into())),
-            }
-        };
-
-        // Check space
+    /// 追加数据块到流式缓存
+    pub async fn append_chunk(&self, key: &str, chunk: &[u8]) -> Result<(), CacheError> {
         let chunk_size = chunk.len() as u64;
-        if current_used_space + chunk_size > max_space {
-            warn!("Cache space exceeded while appending chunk");
-            return Err(PluginError::Storage("Cache space exceeded".into()));
-        }
+        
+        // 检查空间
+        self.ensure_space(chunk_size).await?;
 
-        debug!("Appending {} bytes to cache file for key: {}", chunk_size, key);
+        // 获取文件路径
+        let mut state = self.state.write().await;
+        let entry = state.entries.get_mut(key)
+            .ok_or_else(|| CacheError::NotFound(key.to_string()))?;
 
-        // Write to the file
-        let mut file = tokio::fs::OpenOptions::new()
+        // 追加数据
+        let mut file = File::options()
             .append(true)
-            .open(&entry_path)
-            .await
-            .map_err(|e| PluginError::Storage(format!("Failed to open file: {}", e)))?;
+            .open(&entry.path)
+            .await?;
 
-        file.write_all(chunk).await
-            .map_err(|e| PluginError::Storage(format!("Failed to write chunk: {}", e)))?;
+        file.write_all(chunk).await?;
+        file.flush().await?;
 
-        // Update state with a new mutable reference
+        // 更新状态
+        entry.size += chunk_size;
+        state.used_size += chunk_size;
+
+        // 保存状态
+        drop(state);
+        self.save_state().await?;
+
+        Ok(())
+    }
+
+    /// 完成流式缓存
+    pub async fn finish_stream(&self, key: &str) -> Result<(), CacheError> {
         let mut state = self.state.write().await;
         if let Some(entry) = state.entries.get_mut(key) {
-            entry.size += chunk_size;
-            state.used_space += chunk_size;
+            entry.last_access = Utc::now();
+            // 可以在这里添加其他完成时的处理
         }
-
         Ok(())
     }
+}
 
-    pub fn get_path(&self, key: &str) -> PathBuf {
-        self.make_path(key)
-    }
-
-    // 添加一个辅助方法来生成哈希
-    fn hash_string(&self, s: &str) -> String {
-        let mut hasher = DefaultHasher::new();
-        s.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
-    }
-
-    // 修改路径生成方法
-    fn make_path(&self, key: &str) -> PathBuf {
-        // 分离前缀和路径
-        let parts: Vec<&str> = key.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return self.root_path.join(key);
-        }
-
-        let (prefix, path) = (parts[0], parts[1]);
-
-        // 处理 URL 路径
-        let clean_path = path.trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .trim_start_matches('/');
-
-        // 生成 URL 的哈希
-        let url_hash = self.hash_string(clean_path);
-
-        // 从路径中提取文件扩展名
-        let extension = Path::new(clean_path)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("");
-
-        // 构建最终路径：/cache/prefix/url_hash.ext
-        if extension.is_empty() {
-            self.root_path.join(prefix).join(url_hash)
-        } else {
-            self.root_path.join(prefix).join(format!("{}.{}", url_hash, extension))
-        }
-    }
-
-    // 添加一个方法来保存 URL 映射
-    async fn save_url_mapping(&self, key: &str, path: &Path) -> Result<(), PluginError> {
-        let mapping_file = self.root_path.join("url_mapping.json");
-        
-        let mut mappings = if mapping_file.exists() {
-            let content = tokio::fs::read_to_string(&mapping_file).await
-                .map_err(|e| PluginError::Storage(format!("Failed to read mapping file: {}", e)))?;
-            serde_json::from_str(&content)
-                .unwrap_or_else(|_| HashMap::new())
-        } else {
-            HashMap::new()
-        };
-
-        // 保存完整的映射信息
-        let mapping_info = serde_json::json!({
-            "original_url": key,
-            "cache_path": path.to_string_lossy(),
-            "created_at": chrono::Utc::now().to_rfc3339(),
-            "type": if key.ends_with(".m3u8") { "playlist" } else { "segment" }
-        });
-
-        mappings.insert(key.to_string(), mapping_info);
-
-        let content = serde_json::to_string_pretty(&mappings)
-            .map_err(|e| PluginError::Storage(format!("Failed to serialize mappings: {}", e)))?;
-
-        tokio::fs::write(&mapping_file, content).await
-            .map_err(|e| PluginError::Storage(format!("Failed to write mapping file: {}", e)))?;
-
-        Ok(())
+impl std::fmt::Debug for CacheManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheManager")
+            .field("base_path", &self.base_path)
+            .field("config", &self.config)
+            .finish()
     }
 }
 
@@ -546,12 +450,4 @@ pub struct CacheStats {
     pub max_space: u64,
     pub usage_percent: f64,
     pub last_cleanup: Instant,
-}
-
-// 添加一个辅助结构体来存储缓存信息
-#[derive(Debug)]
-struct CacheInfo {
-    path: PathBuf,
-    metadata: CacheMetadata,
-    size: u64,
 } 

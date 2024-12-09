@@ -3,7 +3,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::signal;
 use tracing::{info, warn, error};
-use hyper::{Body, Client, Request};
 
 use http_cache_server::{
     plugins::cache::{CacheManager, CacheConfig},
@@ -11,16 +10,12 @@ use http_cache_server::{
     prelude::*,
 };
 
-// 测试视频列表
-const TEST_FILES: &[(&str, &str)] = &[
+// 测试流列表
+const TEST_STREAMS: &[(&str, &str)] = &[
     (
-        "Big Buck Bunny (Small)", 
-        "https://sample-videos.com/video321/mp4/240/big_buck_bunny_240p_1mb.mp4"
+        "Sample MP4",
+        "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
     ),
-    // (
-    //     "Sample Video",
-    //     "https://sample-videos.com/video321/mp4/240/sample_240p_1mb.mp4"
-    // ),
 ];
 
 #[tokio::main]
@@ -42,14 +37,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(cache_dir)?;
     
     let cache_config = CacheConfig {
-        max_space: 1024 * 1024 * 1024, // 1GB
-        entry_ttl: Duration::from_secs(3600), // 1小时
+        max_space: 10 * 1024 * 1024 * 1024, // 10GB
+        entry_ttl: Duration::from_secs(3600 * 24), // 24小时
         min_free_space: 1024 * 1024 * 100, // 100MB
     };
     let cache = Arc::new(CacheManager::new(cache_dir, cache_config));
 
     // 创建并配置代理服务器
-    let addr: SocketAddr = "127.0.0.1:3001".parse()?;
+    let addr: SocketAddr = "127.0.0.1:3000".parse()?;
     info!("Creating proxy server on {}", addr);
     let mut proxy_server = ProxyServer::new(addr, cache.clone());
     let mp4_plugin = Arc::new(MP4Plugin::new(cache.clone()));
@@ -71,8 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Waiting for server to start...");
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // 测试所有视频
-    for (name, url) in TEST_FILES {
+    // 测试所有流
+    for (name, url) in TEST_STREAMS {
         info!("=== Testing {} ===", name);
         info!("Original URL: {}", url);
         
@@ -83,10 +78,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 创建客户端请求
         info!("Creating request for {}", name);
-        let client = Client::new();
-        let req = Request::builder()
+        let client = hyper::Client::new();
+        let req = hyper::Request::builder()
             .uri(proxy_url.clone())
-            .body(Body::empty())?;
+            .body(hyper::Body::empty())?;
 
         // 发送请求到代理服务器
         info!("Sending request to proxy for {}", name);
