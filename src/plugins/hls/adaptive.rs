@@ -3,6 +3,7 @@ use tokio::sync::RwLock;
 use std::sync::Arc;
 use tracing::{info, debug};
 use serde::{Serialize, Deserialize};
+use super::types::Variant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bandwidth {
@@ -97,11 +98,16 @@ impl AdaptiveStreamManager {
     }
 
     pub async fn update_bandwidth(&self, stream_id: &str, bandwidth: f64) {
-        debug!("Updating bandwidth for stream {} to {} bps", stream_id, bandwidth);
         let mut streams = self.streams.write().await;
         if let Some(state) = streams.get_mut(stream_id) {
-            state.bandwidth = bandwidth;
-            debug!("Updated bandwidth for stream {} to {} bps", stream_id, bandwidth);
+            const ALPHA: f64 = 0.3;
+            state.bandwidth = state.bandwidth * (1.0 - ALPHA) + bandwidth * ALPHA;
+            debug!(
+                "Updated bandwidth for stream {}: {:.2} Mbps (instant: {:.2} Mbps)",
+                stream_id,
+                state.bandwidth / 1_000_000.0,
+                bandwidth / 1_000_000.0
+            );
         }
     }
 
@@ -112,7 +118,7 @@ impl AdaptiveStreamManager {
             .unwrap_or(1_000_000.0) // 默认 1Mbps
     }
 
-    pub async fn get_optimal_variant<'a>(&self, stream_id: &str, variants: &'a [super::types::Variant]) -> Option<&'a super::types::Variant> {
+    pub async fn get_optimal_variant<'a>(&self, stream_id: &str, variants: &'a [Variant]) -> Option<&'a Variant> {
         let bandwidth = self.get_bandwidth(stream_id).await;
         let target = bandwidth * 0.8;
 

@@ -4,25 +4,23 @@ use serde::{Serialize, Deserialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetadata {
     pub content_type: String,
+    pub last_modified: Option<String>,
     pub etag: Option<String>,
-    pub created_at: DateTime<Utc>,
+    pub ttl: Option<std::time::Duration>,
 }
 
 impl CacheMetadata {
     pub fn new(content_type: String) -> Self {
         Self {
             content_type,
+            last_modified: None,
             etag: None,
-            created_at: Utc::now(),
+            ttl: None,
         }
     }
 
-    pub fn with_etag(mut self, etag: String) -> Self {
-        self.etag = Some(etag);
+    pub fn with_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.ttl = Some(ttl);
         self
-    }
-
-    pub fn content_type(&self) -> &str {
-        &self.content_type
     }
 }

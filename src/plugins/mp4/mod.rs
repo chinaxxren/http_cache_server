@@ -238,8 +238,21 @@ impl MP4Plugin {
 impl Plugin for MP4Plugin {
     fn name(&self) -> &str { "mp4" }
     fn version(&self) -> &str { "1.0.0" }
-    async fn init(&self) -> Result<(), PluginError> { Ok(()) }
-    async fn cleanup(&self) -> Result<(), PluginError> { Ok(()) }
+    
+    async fn init(&self) -> Result<(), PluginError> {
+        Ok(())
+    }
+    
+    async fn cleanup(&self) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    async fn health_check(&self) -> Result<bool, PluginError> {
+        let state = self.state.read().await;
+        info!("MP4 plugin stats:");
+        info!("  - Active downloads: {}", state.downloads.len());
+        Ok(true)
+    }
 }
 
 #[async_trait]

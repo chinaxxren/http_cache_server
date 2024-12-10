@@ -37,6 +37,28 @@ pub struct CacheEntry {
     pub size: u64,
     pub last_access: DateTime<Utc>,
     pub metadata: CacheMetadata,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl CacheEntry {
+    fn new(path: PathBuf, size: u64, metadata: CacheMetadata, ttl: Option<Duration>) -> Self {
+        let expires_at = ttl.map(|d| Utc::now() + chrono::Duration::from_std(d).unwrap());
+        Self {
+            path,
+            size,
+            last_access: Utc::now(),
+            metadata,
+            expires_at,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        if let Some(expires_at) = self.expires_at {
+            Utc::now() > expires_at
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -124,13 +146,26 @@ impl CacheManager {
 
     pub async fn get(&self, key: &str) -> Result<(Vec<u8>, CacheMetadata), CacheError> {
         let mut state = self.state.write().await;
-        if let Some(entry) = state.entries.get_mut(key) {
+        if let Some(entry) = state.entries.get(key) {
+            // 检查是否过期
+            if entry.is_expired() {
+                // 删除过期内容
+                if let Err(e) = tokio::fs::remove_file(&entry.path).await {
+                    warn!("Failed to remove expired cache file {}: {}", entry.path.display(), e);
+                }
+                state.entries.remove(key);
+                return Err(CacheError::NotFound(key.to_string()));
+            }
+
             // 更新访问时间
-            entry.last_access = Utc::now();
-            
-            // 读取文件内容
-            let content = tokio::fs::read(&entry.path).await?;
-            Ok((content, entry.metadata.clone()))
+            if let Some(entry) = state.entries.get_mut(key) {
+                entry.last_access = Utc::now();
+                let content = tokio::fs::read(&entry.path).await
+                    .map_err(|e| CacheError::IO(format!("Failed to read cache file: {}", e)))?;
+                Ok((content, entry.metadata.clone()))
+            } else {
+                Err(CacheError::NotFound(key.to_string()))
+            }
         } else {
             Err(CacheError::NotFound(key.to_string()))
         }
@@ -147,7 +182,8 @@ impl CacheManager {
         self.validate_path(&path)?;
 
         // 写入文件
-        tokio::fs::write(&path, &content).await?;
+        tokio::fs::write(&path, &content).await
+            .map_err(|e| CacheError::IO(format!("Failed to write cache file: {}", e)))?;
 
         // 更新状态
         let mut state = self.state.write().await;
@@ -156,6 +192,7 @@ impl CacheManager {
             size,
             last_access: Utc::now(),
             metadata,
+            expires_at: None,
         });
         state.used_size += size;
 
@@ -207,13 +244,17 @@ impl CacheManager {
 
     async fn save_state(&self) -> Result<(), CacheError> {
         let state = self.state.read().await;
-        let content = serde_json::to_string_pretty(&*state)?;
+        let content = serde_json::to_string_pretty(&*state)
+            .map_err(|e| CacheError::Storage(format!("Failed to serialize state: {}", e)))?;
 
         let temp_path = self.base_path.join("cache_state.json.tmp");
         let final_path = self.base_path.join("cache_state.json");
 
-        tokio::fs::write(&temp_path, &content).await?;
-        tokio::fs::rename(temp_path, final_path).await?;
+        tokio::fs::write(&temp_path, &content).await
+            .map_err(|e| CacheError::IO(format!("Failed to write state file: {}", e)))?;
+
+        tokio::fs::rename(temp_path, final_path).await
+            .map_err(|e| CacheError::IO(format!("Failed to rename state file: {}", e)))?;
 
         Ok(())
     }
@@ -254,7 +295,7 @@ impl CacheManager {
         // 更新使用空间
         state.used_size -= freed_space;
 
-        // 保存状态
+        // 保存状��
         drop(state);
         self.save_state().await?;
 
@@ -340,11 +381,20 @@ impl CacheManager {
     }
 
     fn validate_path(&self, path: &Path) -> Result<(), CacheError> {
+        // 检查路径是否在缓存目录内
         if !path.starts_with(&self.base_path) {
             return Err(CacheError::InvalidPath(
-                format!("Path {} is outside cache directory", path.display())
+                format!("Path must be inside cache directory: {}", path.display())
             ));
         }
+
+        // 检查路径是否包含 ..
+        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err(CacheError::InvalidPath(
+                format!("Path must not contain ..: {}", path.display())
+            ));
+        }
+
         Ok(())
     }
 
@@ -382,6 +432,7 @@ impl CacheManager {
             size: 0,
             last_access: Utc::now(),
             metadata,
+            expires_at: None,
         });
 
         // 保存状态
@@ -430,6 +481,42 @@ impl CacheManager {
             entry.last_access = Utc::now();
             // 可以在这里添加其他完成时的处理
         }
+        Ok(())
+    }
+
+    /// 存储带 TTL 的缓存内容
+    pub async fn store_with_ttl(
+        &self,
+        key: String,
+        data: Vec<u8>,
+        metadata: CacheMetadata,
+        ttl: Duration
+    ) -> Result<(), CacheError> {
+        let size = data.len() as u64;
+        
+        // 检查空间
+        self.ensure_space(size).await?;
+
+        // 生成文件路径
+        let path = self.base_path.join(format!("{}.cache", key));
+        self.validate_path(&path)?;
+
+        // 写入文件
+        tokio::fs::write(&path, &data).await
+            .map_err(|e| CacheError::IO(format!("Failed to write cache file: {}", e)))?;
+
+        // 创建缓存条目
+        let entry = CacheEntry::new(path, size, metadata, Some(ttl));
+
+        // 更新状态
+        let mut state = self.state.write().await;
+        state.used_size += size;
+        state.entries.insert(key, entry);
+        
+        // 保存状态
+        drop(state);
+        self.save_state().await?;
+
         Ok(())
     }
 }
